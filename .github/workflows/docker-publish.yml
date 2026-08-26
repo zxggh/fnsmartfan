@@ -43,28 +43,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ════════════════════════════════════════════════
-      # 新增: 登录 Docker Hub (部署给普通用户用的公共地址)
-      #       在 GitHub Secrets 里添加 DOCKERHUB_USERNAME + DOCKERHUB_TOKEN 后生效
-      #       如果没添加这两个 secret, 这一步自动跳过, 不影响 GHCR 推送
-      # ════════════════════════════════════════════════
-      - name: 登录 Docker Hub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: 提取镜像元数据（标签）
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # 双目标仓库: GHCR(给懂的用户) + Docker Hub(普通用户默认地址, 国内加速源都支持)
-          # 第二行 Docker Hub 的地址只有配置了 DOCKERHUB_USERNAME 才会真正生成标签, 否则是空字符串会被忽略
-          images: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-            ${{ secrets.DOCKERHUB_USERNAME != '' && format('docker.io/{0}/{1}', secrets.DOCKERHUB_USERNAME, env.IMAGE_NAME) || '' }}
+          # GHCR 永远推送 (主仓库)
+          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
             # tag=v1.2.3 → 镜像标签 1.2.3
             type=semver,pattern={{version}}
@@ -73,7 +57,8 @@ jobs:
             # 每次构建带日期+短commit，方便回溯
             type=raw,value={{date 'YYYYMMDD'}}-{{sha}},enable={{is_default_branch}}
 
-      - name: 构建并推送镜像
+      - name: 构建并推送 GHCR 镜像
+        id: build_push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -86,3 +71,108 @@ jobs:
           # 缓存加速，第二次构建通常 10 秒内完成
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ═══════════════════════════════════════════════════════
+      # 新增: 同步推送到 Docker Hub (任何人都能用, 国内加速源都支持)
+      # ⚠ 为什么用 bash 条件而不是 if: ${{ secrets.xxx }} ?
+      #   GitHub Actions 出于安全原因, 在 if: 表达式里禁止直接访问 secrets
+      #   (会报 Unrecognized named-value: 'secrets'), 所以用 bash 级判断绕过
+      # 配置方法(只做一次): 在仓库 Settings → Secrets and variables → Actions 里加两个 Secrets:
+      #   DOCKERHUB_USERNAME = 你的 Docker Hub 用户名 (比如 zxggh)
+      #   DOCKERHUB_TOKEN    = hub.docker.com → Settings → Security → New Access Token (Read & Write)
+      # 如果没加这两个 Secrets, 这一步自动跳过, 不影响 GHCR 推送
+      # ═══════════════════════════════════════════════════════
+      - name: （可选）同步推送到 Docker Hub 公共仓库
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          GHCR_LATEST: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          set +e
+          echo "================================================================"
+          echo " 检查是否配置了 Docker Hub Secrets (DOCKERHUB_USERNAME + DOCKERHUB_TOKEN)"
+          echo "================================================================"
+          if [ -z "$DH_USER" ] || [ -z "$DH_TOKEN" ]; then
+            echo "ℹ 未配置 DOCKERHUB_* Secrets, 跳过 Docker Hub 同步推送."
+            echo "  (如需推送, 到仓库 Settings → Secrets and variables → Actions 添加两个 Secrets)"
+            exit 0
+          fi
+          echo "✅ 已检测到 DOCKERHUB_* Secrets, 开始同步推送到 docker.io/$DH_USER/$IMAGE_NAME"
+          echo ""
+
+          # ---------- 1. 登录 Docker Hub ----------
+          echo "▶ [1/4] 登录 Docker Hub..."
+          echo "$DH_TOKEN" | docker login docker.io -u "$DH_USER" --password-stdin
+          if [ $? -ne 0 ]; then
+            echo "❌ Docker Hub 登录失败! 请检查 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN 是否正确"
+            exit 1
+          fi
+          echo ""
+
+          # ---------- 2. 解析 GHCR 镜像 digest ----------
+          # buildx 多平台构建后返回的 metadata 里有真实的 manifest digest, 优先用这个
+          echo "▶ [2/4] 解析刚构建的 GHCR 镜像 manifest digest..."
+          DIGEST="${{ steps.build_push.outputs.digest }}"
+          if [ -z "$DIGEST" ]; then
+            # 兜底: 如果 build-push 没返回 digest, 用本地 docker inspect 拿
+            DIGEST=$(docker inspect "$GHCR_LATEST" --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2)
+          fi
+          if [ -z "$DIGEST" ]; then
+            echo "❌ 拿不到 GHCR 镜像 digest! 跳过 Docker Hub 推送"
+            exit 1
+          fi
+          echo "  manifest digest: $DIGEST"
+          echo ""
+
+          # ---------- 3. 从 META_TAGS 提取标签 (去掉 ghcr.io/... 前缀, 只留 :标签) ----------
+          # ⚠ 注意: 不能用管道 while read (会开子 shell, PUSH_OK 计数丢失)
+          #         用 IFS + for 循环保证变量作用域一致
+          echo "▶ [3/4] 打 Docker Hub 标签 + 推送"
+          DH_PREFIX="docker.io/$DH_USER/$IMAGE_NAME"
+          PUSH_OK=0
+          IFS=',' read -ra TAGS_ARR <<< "$META_TAGS"
+          for FULL_TAG in "${TAGS_ARR[@]}"; do
+            [ -z "$FULL_TAG" ] && continue
+            # 提取 :标签 部分 (比如 :latest, :20260826-abc123, :1.0.0)
+            TAG_SUFFIX=$(echo "$FULL_TAG" | grep -oE ':[^:]+$' | head -1)
+            [ -z "$TAG_SUFFIX" ] && continue
+            DH_IMAGE="${DH_PREFIX}${TAG_SUFFIX}"
+
+            echo "  ┌─────────────────────────────────────────────────────────"
+            echo "  │ 处理标签: $TAG_SUFFIX"
+            echo "  │ 源镜像: ${GHCR_LATEST%:*}@${DIGEST}"
+            echo "  │ 目标:   $DH_IMAGE"
+            echo "  └─────────────────────────────────────────────────────────"
+
+            # buildx 多平台构建已经在 buildx cache 里了, 用 buildx imagetools create 复用 manifest (不用重拉/重构建)
+            docker buildx imagetools create -t "$DH_IMAGE" "${GHCR_LATEST%:*}@${DIGEST}"
+            if [ $? -eq 0 ]; then
+              PUSH_OK=$((PUSH_OK + 1))
+              echo "  ✅ 推送成功: $DH_IMAGE"
+            else
+              # 兜底: imagetools 失败时(比如 cache 没了), 用普通 tag + push
+              echo "  ⚠ imagetools 失败, 尝试普通 docker tag + push..."
+              docker tag "${GHCR_LATEST%:*}@${DIGEST}" "$DH_IMAGE" 2>/dev/null
+              docker push "$DH_IMAGE" 2>/dev/null
+              if [ $? -eq 0 ]; then
+                PUSH_OK=$((PUSH_OK + 1))
+                echo "  ✅ (兜底)推送成功: $DH_IMAGE"
+              else
+                echo "  ❌ 推送失败: $DH_IMAGE"
+              fi
+            fi
+            echo ""
+          done
+
+          # ---------- 4. 登出 + 汇总 ----------
+          echo "▶ [4/4] 登出 Docker Hub (清除本地凭据)"
+          docker logout docker.io 2>/dev/null || true
+
+          echo ""
+          echo "================================================================"
+          echo " 🎉 Docker Hub 同步完成: 成功推送 ${PUSH_OK} 个标签"
+          echo "    其他用户部署直接运行:  docker pull $DH_PREFIX:latest"
+          echo "================================================================"
