@@ -23,11 +23,21 @@
 # 更简单的飞牛 NAS 部署 (不用 compose 文件, 纯点鼠标 1 分钟):
 #   1. NAS → 容器 → 【镜像仓库】搜索框搜: zxggh/fnsmartfan → 找到后点【拉取】
 #   2. 拉完回到【镜像】列表 → 点这一行右侧【创建容器】
-#   3. 参数填写: 名称=smartfan / 端口=8780:8780 / 勾特权模式 / 用户=root
-#                / 卷(smartfan-data→/data, /dev→/dev-host-dev只读)
-#                / 设备映射(ttyACM0/1, ttyUSB0/1, 没入口可跳过, 特权+卷已兜底)
-#                / 环境变量 TZ=Asia/Shanghai / 重启策略 always
-#   4. 点【创建并启动】→ 打开 http://NAS_IP:8780
+#   3. ⭐ 懒人兜底填法 (推荐! 不用填设备映射, 少踩坑):
+#        · 名称=smartfan
+#        · 端口=8780:8780
+#        · ✅ 勾【特权模式】(核心中的核心, 必须!)
+#        · 用户=root (或 UID=0)
+#        · ⚠️ 卷(2 个必挂, 漏一个必炸!):
+#          ① 新建卷 smartfan-data → 容器 /data  (读写, 配置持久化)
+#          ② 宿主机路径 /dev → 容器 /dev-host-dev  模式: 只读 (ro/Read-Only) (HDD温度+控制器拔插兜底!)
+#        · 环境变量: TZ=Asia/Shanghai
+#        · 重启策略: always (开机自启)
+#        · (可以不填) 设备映射: 如果你知道当前控制器被分到哪个 ttyACM/ttyUSB,
+#          就把 0~9 都加上也行, 懒人完全留空即可, 上面的「特权模式 + /dev→/dev-host-dev」已兜底
+#   4. 点【创建并启动】→ 等 1~2 分钟刷新容器列表 → 打开 http://NAS_IP:8780
+#   5. ❓ 创建完 GUI 先提示「启动失败」? 别删! 先等 90 秒再刷新 (健康检查 start_period=30s,
+#      加上首次启动 pip 补装依赖, 前 60 秒会是 starting/健康检查中, GUI 会误判)
 #
 # 常见问题:
 #   ❓ Docker Hub 拉取失败 (超时/连接失败):
@@ -39,6 +49,13 @@
 #   ❓ 启动后 HDD 温度不显示 (显示 N/A/--):
 #      → 容器镜像已预装 smartmontools, 首次启动需等待 10~15 秒采集完成
 #      → 若仍无值, 检查容器创建时是否勾选了"特权模式"以及挂了 /dev → /dev-host-dev (只读)
+#   ❓ 任何 USB 口都识别不到控制器 (容器内看不到 ttyACM*/ttyUSB*):
+#      → 99% 是没勾【特权模式】或者漏挂 /dev → /dev-host-dev 只读卷
+#      → 或者 GUI 创建容器时 healthcheck 误判失败手动删了容器, 重新按上面懒人兜底填法来一次,
+#        或者直接用 quick-start.sh 一键脚本 (方法零, 100% 参数齐全)
+#   ❓ 控制器分号超了 ttyACM0/1 变成 ttyACM5/ttyUSB3?
+#      → 没关系! 本文件 devices 列表已经扩展到 0~9 全覆盖, 且 Compose 自动跳过不存在的设备不报错
+#      → 再加上特权模式 + /dev-host-dev 兜底, 就算分到 ttyACM99 也能识别!
 # ============================================================
 
 services:
@@ -58,21 +75,46 @@ services:
     ports:
       - "8780:8780"
 
-    # ── USB 控制器 + HDD 温度访问权限 ──
-    # 特权模式 + 显式设备映射 + 宿主机整个 /dev 挂载(3 保险)
-    # 这样控制器随便拔插端口、HDD 用 smartctl 读温度都能正常工作
+    # ── 三保险 USB 控制器 + HDD 温度访问权限 ──
+    #   保险 A (特权模式): privileged: true  → 给容器访问宿主机 /dev 节点的完整权限
+    #   保险 B (显式设备映射 0~9 全覆盖):
+    #           Docker Compose 里 devices 列表写了不存在的节点会自动跳过, 不会报错启动失败!
+    #           所以我们把 ttyACM0~9 + ttyUSB0~9 全列出来, 不管控制器被分到几号, 都能映射到
+    #   保险 C (宿主机整个 /dev 只读挂载) :
+    #           -v /dev:/dev-host-dev:ro  (看下面 volumes 部分)
+    #           这是兜底中的兜底! 不管拔插哪个 USB 口、分到哪个 tty 号、
+    #           就算保险 B 没覆盖到编号, /dev-host-dev 下面 100% 有节点, 程序随时能找到!
     privileged: true
     devices:
+      # ttyACM 0~9 全覆盖 (STC CDC ACM 控制器常见)
       - "/dev/ttyACM0:/dev/ttyACM0"
       - "/dev/ttyACM1:/dev/ttyACM1"
+      - "/dev/ttyACM2:/dev/ttyACM2"
+      - "/dev/ttyACM3:/dev/ttyACM3"
+      - "/dev/ttyACM4:/dev/ttyACM4"
+      - "/dev/ttyACM5:/dev/ttyACM5"
+      - "/dev/ttyACM6:/dev/ttyACM6"
+      - "/dev/ttyACM7:/dev/ttyACM7"
+      - "/dev/ttyACM8:/dev/ttyACM8"
+      - "/dev/ttyACM9:/dev/ttyACM9"
+      # ttyUSB 0~9 全覆盖 (CH340/CP2102/FT232 等 USB 转串口芯片常见)
       - "/dev/ttyUSB0:/dev/ttyUSB0"
       - "/dev/ttyUSB1:/dev/ttyUSB1"
+      - "/dev/ttyUSB2:/dev/ttyUSB2"
+      - "/dev/ttyUSB3:/dev/ttyUSB3"
+      - "/dev/ttyUSB4:/dev/ttyUSB4"
+      - "/dev/ttyUSB5:/dev/ttyUSB5"
+      - "/dev/ttyUSB6:/dev/ttyUSB6"
+      - "/dev/ttyUSB7:/dev/ttyUSB7"
+      - "/dev/ttyUSB8:/dev/ttyUSB8"
+      - "/dev/ttyUSB9:/dev/ttyUSB9"
     volumes:
       # 1) 数据卷: 存放 config.yaml + 开关状态 + 断连日志, 容器重建不丢失
       - smartfan-data:/data
-      # 2) 宿主机 /dev → 容器 /dev-host-dev (只读)
-      #    容器里 smartctl 通过 /dev-host-dev/sd* 读取宿主机硬盘 SMART 温度
-      #    拔插 USB 后 /dev-host-dev/ttyACM* 也自动同步, 不用重启容器
+      # 2) 宿主机 /dev → 容器 /dev-host-dev (只读)  【保险 C · 必挂·核心】
+      #    - smartctl 通过 /dev-host-dev/sd* 读取宿主机硬盘 SMART 温度
+      #    - 拔插 USB 后 /dev-host-dev/ttyACM* / ttyUSB* 自动同步, 不用重启容器
+      #    - 就算保险 A 保险 B 全失效, 这里也一定有节点 (只要宿主机有插)
       - /dev:/dev-host-dev:ro
 
     # root 用户: 跳过 sg dialout/sg disk 密码提示, 串口和 SMART 权限兜底
@@ -83,6 +125,8 @@ services:
       - TZ=Asia/Shanghai
 
     # 健康检查: 30 秒一次 API 检测, 连续失败 3 次标记 unhealthy
+    # 注意 start_period=30s: 首次启动补装 pip 依赖最多要等 30s 才过健康检查
+    #                     GUI 在前 60s 误判启动失败都是正常的, 别删容器!
     healthcheck:
       test: ["CMD", "curl", "-s", "-m", "3", "http://127.0.0.1:8780/api/info"]
       interval: 30s

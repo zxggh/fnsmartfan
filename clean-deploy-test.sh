@@ -4,8 +4,14 @@
 #
 #  功能: 100% 模拟拿到一台全新 NAS
 #        → 删除所有容器/镜像/数据卷
-#        → 仅通过 docker-compose.yml 远程拉镜像部署
+#        → 仅通过 docker-compose.yml (三保险版) 远程拉镜像部署
 #        → 自动验证 4 项关键功能
+#
+#  本脚本配套使用的 docker-compose.yml 已经是 「三保险·控制器识别」配置:
+#   保险 A (特权模式): privileged: true
+#   保险 B (设备映射 0~9 全覆盖): ttyACM0~9 + ttyUSB0~9 (Compose 自动跳过不存在的不报错)
+#   保险 C (/dev 整卷只读兜底): volumes 里挂 /dev:/dev-host-dev:ro (任意 USB 口拔插/任意编号都能识别)
+#
 #  用法: bash clean-deploy-test.sh
 # ============================================================
 
@@ -263,6 +269,26 @@ done
 echo ""
 info "容器状态: $(docker ps --filter name=smartfan --format '{{.Status}}')"
 check_result "容器启动 & web 服务就绪" $READY
+
+# ── 三保险容器自检: 确认保险 C (/dev-host-dev) 真的挂上了 ──
+echo ""
+echo "▶ 三保险自检: 保险 C · /dev-host-dev 卷挂载有效性"
+HOST_DEV_USB=$(ls -1 /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | wc -l)
+if [ "$HOST_DEV_USB" -gt 0 ]; then
+  info "宿主机发现 $HOST_DEV_USB 个真实 USB 串口设备: $(ls -1 /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | tr '\n' ' ')"
+fi
+HOST_DEV_LIST=$(docker exec smartfan bash -c 'ls -1 /dev-host-dev/ttyACM* /dev-host-dev/ttyUSB* 2>/dev/null || true' 2>/dev/null | wc -l)
+DEV_LIST=$(docker exec smartfan bash -c 'ls -1 /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true' 2>/dev/null | wc -l)
+info "容器内可见: 保险 B(/dev/下设备)=$DEV_LIST 个, 保险 C(/dev-host-dev/下设备)=$HOST_DEV_LIST 个"
+THREE_INS_OK=0
+if [ "$HOST_DEV_LIST" -ge "$HOST_DEV_USB" ] || [ "$DEV_LIST" -ge 1 ] || [ "$HOST_DEV_USB" -eq 0 ]; then
+  THREE_INS_OK=1
+fi
+check_result "三保险生效 (只要启动时有设备, /dev-host-dev 下必然可见)" $THREE_INS_OK
+if [ "$THREE_INS_OK" -eq 0 ]; then
+  warn "三保险不生效! 99% 是 docker-compose.yml 不是最新版本 (没 /dev:/dev-host-dev:ro 或没 privileged:true)"
+  info "建议: 删除当前容器/镜像 → 下载最新 DEPLOY.md 的 quick-start.sh 一键脚本重新部署 (方法零 100% 生效)"
+fi
 
 # ═══════════════════════════════════════════════
 # 4. 验证 4 项关键功能

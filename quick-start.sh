@@ -131,11 +131,19 @@ fi
 pass "已就绪镜像: $TARGET_IMAGE  (IMAGE_ID=$(get_id "$TARGET_IMAGE"))"
 
 # ═══════════════════════════════════════════════
-# 4. 清旧容器 + 启动 (万能参数)
+# 4. 清旧容器 + 启动 (三保险万能参数)
+#     保险 A: --privileged 特权模式 + -v /dev:/dev-host-dev:ro 宿主机整个 /dev 只读进容器
+#             -> 这是兜底中的兜底! 只要 USB 插了, 控制器不管被分到 ttyACM* 几号,
+#                容器里 /dev-host-dev/ 下 100% 能看到设备节点, 完全不依赖 --device
+#     保险 B: 动态扫描宿主机当前真实存在的 ttyACM(0-9) + ttyUSB(0-9),
+#             只 --device 映射真有的节点, 不存在的完全跳过, 再也不会因设备不存在启动失败!
+#     保险 C: 就算启动时控制器没插 (保险 B 一个都没映射到),
+#             保险 A 依然能兜底 -> 之后任何时候插上控制器, 拔插任何 USB 口,
+#             容器都能通过 /dev-host-dev/ 立即识别, 不用重建容器!
 # ═══════════════════════════════════════════════
 echo ""
 echo "──────────────────────────────────────────────"
-echo " [2/3] 清旧容器 + 启动 smartfan (万能参数)"
+echo " [2/3] 清旧容器 + 启动 smartfan (三保险·万能参数)"
 echo "──────────────────────────────────────────────"
 
 # 清旧
@@ -143,18 +151,43 @@ info "清理同名旧容器 smartfan ..."
 docker rm -f smartfan >/dev/null 2>&1 || true
 pass "清场完毕"
 
-# 万能启动 (和之前命令行 100% 成功那行完全一致)
-info "docker run 启动容器 (所有参数齐全: 特权/root/卷/设备/端口/时区/日志轮转/健康检查) ..."
+# ── 保险 B: 动态扫描宿主机真实存在的串口设备 (0~9 全覆盖) ──
+DEVICE_ARGS=()
+DETECTED=0
+info "扫描宿主机 ttyACM0~9 + ttyUSB0~9 真实存在的设备节点 ..."
+for i in $(seq 0 9); do
+  if [ -e "/dev/ttyACM$i" ]; then
+    DEVICE_ARGS+=("--device")
+    DEVICE_ARGS+=("/dev/ttyACM$i:/dev/ttyACM$i")
+    DETECTED=$((DETECTED+1))
+    echo "    · 发现设备: /dev/ttyACM$i  → 已映射"
+  fi
+done
+for i in $(seq 0 9); do
+  if [ -e "/dev/ttyUSB$i" ]; then
+    DEVICE_ARGS+=("--device")
+    DEVICE_ARGS+=("/dev/ttyUSB$i:/dev/ttyUSB$i")
+    DETECTED=$((DETECTED+1))
+    echo "    · 发现设备: /dev/ttyUSB$i  → 已映射"
+  fi
+done
+
+if [ "$DETECTED" -gt 0 ]; then
+  pass "保险 B: 动态映射 $DETECTED 个真实串口设备到容器内 /dev/ 下"
+else
+  warn "保险 B: 当前没发现任何 ttyACM/ttyUSB 设备 (控制器还没插?)"
+  info "  没关系! 保险 A 兜底: 下面启动完容器后, 任何时候插上控制器都能立即识别, 不用重建容器!"
+fi
+
+# 万能启动 (保险 A: --privileged + -v /dev:/dev-host-dev:ro)
+info "docker run 启动容器 (保险 A 特权模式 + /dev-host-dev 兜底 + 保险 B 动态设备映射) ..."
 RC=$(docker run -d \
   --name smartfan \
   --user root \
   --privileged \
   --restart always \
   -p "$PORT:$PORT" \
-  --device /dev/ttyACM0:/dev/ttyACM0 \
-  --device /dev/ttyACM1:/dev/ttyACM1 \
-  --device /dev/ttyUSB0:/dev/ttyUSB0 \
-  --device /dev/ttyUSB1:/dev/ttyUSB1 \
+  "${DEVICE_ARGS[@]}" \
   -v smartfan-data:/data \
   -v /dev:/dev-host-dev:ro \
   -e TZ=Asia/Shanghai \
@@ -176,7 +209,7 @@ else
   echo "  docker run 返回值: $RUN_RC"
   echo "  错误输出: $RC"
   echo ""
-  echo "  常见原因: 端口 $PORT 被占用 / docker 服务异常 / 设备映射冲突"
+  echo "  常见原因: 端口 $PORT 被占用 / docker 服务异常 / 设备文件权限不足"
   exit 5
 fi
 

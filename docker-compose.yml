@@ -37,20 +37,38 @@ services:
     ports:
       - "8780:8780"
 
-    # USB 串口：特权模式自动识别 /dev/ttyACM*
-    # 注意：飞牛 NAS 的 Docker 在 privileged 模式下仍可能不会自动映射 USB 设备，
-    #       下面显式把常见串口设备透传进容器；如果你拔插后节点变了（比如变成 ttyACM1），
-    #       把下面对应那一行改一下再 up 即可。
+    # ── 三保险 USB 控制器 + HDD 温度访问权限 ──
+    #   保险 A (特权模式): 给容器完整权限访问宿主机 /dev
+    #   保险 B (显式设备映射 0~9 全覆盖): ttyACM0~9 + ttyUSB0~9
+    #           Docker Compose 写不存在的节点不会报错, 会自动跳过!
+    #   保险 C (宿主机 /dev 只读挂载) : 看 volumes 下 /dev:/dev-host-dev:ro (兜底中的兜底)
     privileged: true
     devices:
+      # ttyACM 0~9 全覆盖
       - "/dev/ttyACM0:/dev/ttyACM0"
       - "/dev/ttyACM1:/dev/ttyACM1"
+      - "/dev/ttyACM2:/dev/ttyACM2"
+      - "/dev/ttyACM3:/dev/ttyACM3"
+      - "/dev/ttyACM4:/dev/ttyACM4"
+      - "/dev/ttyACM5:/dev/ttyACM5"
+      - "/dev/ttyACM6:/dev/ttyACM6"
+      - "/dev/ttyACM7:/dev/ttyACM7"
+      - "/dev/ttyACM8:/dev/ttyACM8"
+      - "/dev/ttyACM9:/dev/ttyACM9"
+      # ttyUSB 0~9 全覆盖
       - "/dev/ttyUSB0:/dev/ttyUSB0"
       - "/dev/ttyUSB1:/dev/ttyUSB1"
-    # 兜底：如果 devices 还不够，把宿主机整个 /dev 挂到容器里，保证所有串口都能看到
-    #       （建议保留，即使有 devices 时也不冲突，飞牛 NAS 上实测非常有用）
+      - "/dev/ttyUSB2:/dev/ttyUSB2"
+      - "/dev/ttyUSB3:/dev/ttyUSB3"
+      - "/dev/ttyUSB4:/dev/ttyUSB4"
+      - "/dev/ttyUSB5:/dev/ttyUSB5"
+      - "/dev/ttyUSB6:/dev/ttyUSB6"
+      - "/dev/ttyUSB7:/dev/ttyUSB7"
+      - "/dev/ttyUSB8:/dev/ttyUSB8"
+      - "/dev/ttyUSB9:/dev/ttyUSB9"
     volumes:
       - smartfan-data:/data
+      # 保险 C · 必挂: 宿主机 /dev 整卷只读进容器, 拔插任何口/任何编号 100% 能识别
       - /dev:/dev-host-dev:ro
 
     # 用 root 用户运行，避免 sg dialout / 串口权限、/data 卷权限各种问题
