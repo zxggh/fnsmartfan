@@ -1,0 +1,42 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# ========== 日志 ==========
+*.log
+log.txt
+logs/
+
+# ========== Docker 本地产物（不要上传，太大） ==========
+*.tar
+smartfan-image.tar
+build/
+dist/
+
+# ========== 系统 ==========
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ========== 编辑器 ==========
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ========== 临时文件 ==========
+*.tmp
+*.temp
