@@ -108,39 +108,132 @@ info "剩余: 镜像=$IMG_REMAIN 容器=$CT_REMAIN 卷=$VL_REMAIN"
 check_result "清场干净(镜像/容器/卷都为0)" $([ "$IMG_REMAIN" -eq 0 ] && [ "$CT_REMAIN" -eq 0 ] && [ "$VL_REMAIN" -eq 0 ] && echo 1 || echo 0)
 
 # ═══════════════════════════════════════════════
-# 2. 拉取远程镜像
+# 2. 拉取远程镜像 (修复版: 不看退出码, 看 docker images 是否真的有 IMAGE_ID)
 # ═══════════════════════════════════════════════
 echo ""
 echo "──────────────────────────────────────────────"
 echo " [2/6] 拉取 ghcr.io/zxggh/fnsmartfan:latest"
 echo "──────────────────────────────────────────────"
-echo "(这一步如果报 401/denied, 说明 NAS docker.fnnas.com 代理拦截 GHCR 公共镜像,"
-echo " 走脚本末尾的 Fallback 方案即可)"
+echo "(如果报 401/unauthorized → 飞牛 docker.fnnas.com 代理拦截了 GHCR 公共镜像)"
+echo "(脚本会自动尝试 Fallback: 本地 tar 导入 / PAT 登录重新拉)"
 sleep 2
 
-PULL_START=$(date +%s)
-docker pull ghcr.io/zxggh/fnsmartfan:latest 2>&1 | tail -10
-PULL_RC=$?
-PULL_SEC=$(( $(date +%s) - PULL_START ))
-echo ""
-info "拉取耗时: ${PULL_SEC}s, 退出码=$PULL_RC"
-check_result "远程镜像拉取成功" $([ "$PULL_RC" -eq 0 ] && echo 1 || echo 0)
+TARGET_IMAGE="ghcr.io/zxggh/fnsmartfan:latest"
+get_image_id() {
+  docker images --format "{{.ID}}" "$TARGET_IMAGE" 2>/dev/null | head -n 1
+}
+BEFORE_ID="$(get_image_id)"
 
-if [ "$PULL_RC" -ne 0 ]; then
+PULL_START=$(date +%s)
+# 不用管道 tail → 否则 $? 是 tail 的退出码, 不是 docker pull 的
+PULL_LOG=$(docker pull "$TARGET_IMAGE" 2>&1 || true)
+PULL_RC=$?
+echo "$PULL_LOG" | tail -15
+PULL_SEC=$(( $(date +%s) - PULL_START ))
+AFTER_ID="$(get_image_id)"
+
+echo ""
+info "拉取耗时: ${PULL_SEC}s, 拉取前 IMAGE_ID=${BEFORE_ID:-空}, 拉取后 IMAGE_ID=${AFTER_ID:-空}"
+
+# ✅ 真正的成功判断: AFTER_ID 非空 且 不等于 BEFORE_ID (或之前空现在有了)
+PULL_OK=0
+if [ -n "$AFTER_ID" ] && [ "$AFTER_ID" != "$BEFORE_ID" ]; then PULL_OK=1; fi
+# 兼容: 如果之前已经有同一个 ID (比如镜像没变化), 也算 OK
+if [ -z "$BEFORE_ID" ] && [ -n "$AFTER_ID" ]; then PULL_OK=1; fi
+if [ -n "$BEFORE_ID" ] && [ -n "$AFTER_ID" ] && [ "$AFTER_ID" = "$BEFORE_ID" ]; then PULL_OK=1; fi
+check_result "远程镜像拉取成功 (IMAGE_ID 存在)" $PULL_OK
+
+# ──────────────────── 拉取失败 → Fallback 自动处理 ────────────────────
+if [ "$PULL_OK" -ne 1 ]; then
   echo ""
-  warn "拉取失败! Fallback 方案:"
-  echo "  A) Windows 本地 Docker Desktop 拉取 → save tar → 上传 NAS → docker load"
-  echo "  B) docker login ghcr.io 认证后再拉(公共镜像偶尔也需要登录,因为 NAS 代理)"
-  echo "  C) 不验证了, 直接用之前 commit 的本地镜像"
+  warn "GHCR 拉取失败 (通常是飞牛 NAS docker.fnnas.com 代理拦截公共镜像, 即使镜像公开也会401)"
+  echo "  🔧 自动执行 Fallback 流程:"
+
+  FALLBACK_DONE=0
+
+  # Fallback A: 搜索本地所有 fnsmartfan*.tar, 优先选体积最大的(完整镜像)
   echo ""
-  # 给用户一个选择: 是否回退用 fnsmartfan:v2 本地镜像(如果存在 tar)
-  if [ -f "$DEPLOY_DIR/fnsmartfan-v2.tar" ]; then
-    read -r -p "  检测到 fnsmartfan-v2.tar, 是否回退导入? [Y/n]: " FALLBACK
-    if [ "$FALLBACK" != "n" ] && [ "$FALLBACK" != "N" ]; then
-      info "导入 fnsmartfan-v2.tar 作为 fallback..."
-      docker load -i "$DEPLOY_DIR/fnsmartfan-v2.tar" 2>&1 | tail -3
-      docker tag fnsmartfan:v2 ghcr.io/zxggh/fnsmartfan:latest 2>/dev/null || true
+  echo "  [A] 扫描本地 fnsmartfan*.tar 备份..."
+  TARS=$(find "$DEPLOY_DIR" -maxdepth 2 -type f \( -name "fnsmartfan*.tar" -o -name "*fnsmartfan*.tar*" \) -printf '%s %p\n' 2>/dev/null | sort -rn)
+  TAR_COUNT=$(echo "$TARS" | grep -c . || true)
+  if [ "$TAR_COUNT" -gt 0 ]; then
+    info "发现 $TAR_COUNT 个 tar 备份:"
+    echo "$TARS" | while read -r sz p; do
+      echo "    - $(echo "scale=1;$sz/1024/1024" | bc 2>/dev/null || echo "$sz bytes") $p"
+    done
+    # 自动选体积最大的那个加载
+    BEST_TAR=$(echo "$TARS" | head -n 1 | sed 's/^[0-9]* //')
+    echo ""
+    read -r -p "  是否自动加载 $BEST_TAR ? [Y/n]: " FALLBACK_TAR
+    if [ "$FALLBACK_TAR" != "n" ] && [ "$FALLBACK_TAR" != "N" ]; then
+      info "正在 docker load -i $BEST_TAR ..."
+      if docker load -i "$BEST_TAR" 2>&1 | tail -5; then
+        # 加载成功后, 把结果 tag 成 TARGET_IMAGE (让 compose 能匹配)
+        LOADED_TAG=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^fnsmartfan:" | head -n 1)
+        if [ -z "$LOADED_TAG" ]; then
+          LOADED_TAG="fnsmartfan:latest"
+        fi
+        info "docker tag $LOADED_TAG → $TARGET_IMAGE"
+        docker tag "$LOADED_TAG" "$TARGET_IMAGE" 2>/dev/null || true
+        docker tag "$LOADED_TAG" "fnsmartfan:latest" 2>/dev/null || true
+        FALLBACK_DONE=1
+      fi
     fi
+  else
+    warn "  没有找到任何 fnsmartfan*.tar 备份"
+  fi
+
+  # Fallback B: docker login ghcr.io (用 PAT) 然后重新 pull
+  if [ "$FALLBACK_DONE" -ne 1 ]; then
+    echo ""
+    echo "  [B] Fallback: 用 GitHub PAT 登录 GHCR 后重新 pull (解决代理拦截公共镜像的问题)"
+    echo "      (如果你还没有 PAT, 去 https://github.com/settings/tokens 勾选 write:packages 生成)"
+    read -r -p "  是否输入 GitHub 用户名+PAT 重新登录? [y/N]: " FALLBACK_LOGIN
+    if [ "$FALLBACK_LOGIN" = "y" ] || [ "$FALLBACK_LOGIN" = "Y" ]; then
+      read -r -p "    GitHub 用户名 (默认 zxggh): " GH_USER
+      [ -z "$GH_USER" ] && GH_USER="zxggh"
+      read -r -s -p "    GitHub Classic PAT (复制后回车, 不会显示): " GH_PAT
+      echo ""
+      if echo "$GH_PAT" | docker login ghcr.io -u "$GH_USER" --password-stdin 2>&1 | tail -3; then
+        info "登录成功! 重新 pull $TARGET_IMAGE ..."
+        docker pull "$TARGET_IMAGE" 2>&1 | tail -10 || true
+      else
+        warn "  登录失败, 跳过 Fallback B"
+      fi
+    fi
+  fi
+
+  # Fallback C: 确认镜像现在是否存在 (以上任何一种 Fallback 成功后)
+  AFTER_FB_ID="$(get_image_id)"
+  if [ -n "$AFTER_FB_ID" ]; then
+    pass "Fallback 后镜像已就绪 (IMAGE_ID=$AFTER_FB_ID)"; PULL_OK=1; PASS_CNT=$((PASS_CNT+1))
+  else
+    # 最后再兜底: 扫本地所有 fnsmartfan:* 标签, 随便 tag 一个为 TARGET_IMAGE
+    ANY_LOCAL=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^fnsmartfan:" | head -n 1)
+    if [ -n "$ANY_LOCAL" ]; then
+      warn "  发现本地镜像 $ANY_LOCAL, 自动 tag 成 $TARGET_IMAGE (临时兜底)"
+      docker tag "$ANY_LOCAL" "$TARGET_IMAGE" 2>/dev/null || true
+      AFTER_FB_ID="$(get_image_id)"
+      if [ -n "$AFTER_FB_ID" ]; then PULL_OK=1; fi
+    fi
+  fi
+
+  # 如果 Fallback 还是没镜像, 提醒用户并退出
+  if [ "$PULL_OK" -ne 1 ]; then
+    echo ""
+    fail "所有 Fallback 方案均未获得可用镜像! 中止脚本"
+    echo ""
+    echo "  手动解决办法:"
+    echo "  方法 1 (推荐): Windows 本地 Docker Desktop 执行:"
+    echo "    docker login ghcr.io -u zxggh"
+    echo "    docker pull ghcr.io/zxggh/fnsmartfan:latest"
+    echo "    docker save ghcr.io/zxggh/fnsmartfan:latest -o fnsmartfan-latest.tar"
+    echo "    → 把 tar 上传到 $DEPLOY_DIR/ 后重新执行本脚本"
+    echo ""
+    echo "  方法 2: 在 NAS 任务计划 (非 webSSH, webSSH 是非交互环境) 里一次性跑:"
+    echo "    echo '你的_Classic_PAT' | docker login ghcr.io -u zxggh --password-stdin"
+    echo "    docker pull ghcr.io/zxggh/fnsmartfan:latest"
+    exit 1
   fi
 fi
 
