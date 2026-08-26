@@ -1,4 +1,4 @@
-name: 构建并发布 SmartFan Docker 镜像到 GHCR
+name: 构建并发布 SmartFan Docker 镜像到 GHCR + Docker Hub
 
 # 触发条件：
 #   - 推送代码到 main 分支 → 自动打 latest + 日期版本标签并发布
@@ -18,7 +18,7 @@ permissions:
   packages: write
 
 env:
-  # 镜像名（会自动拼成 ghcr.io/<仓库所有者>/fnsmartfan:标签）
+  # 镜像名（会自动拼成 ghcr.io/<仓库所有者>/fnsmartfan:标签 以及 docker.io/<用户>/fnsmartfan:标签）
   IMAGE_NAME: fnsmartfan
 
 jobs:
@@ -43,11 +43,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ════════════════════════════════════════════════
+      # 新增: 登录 Docker Hub (部署给普通用户用的公共地址)
+      #       在 GitHub Secrets 里添加 DOCKERHUB_USERNAME + DOCKERHUB_TOKEN 后生效
+      #       如果没添加这两个 secret, 这一步自动跳过, 不影响 GHCR 推送
+      # ════════════════════════════════════════════════
+      - name: 登录 Docker Hub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: 提取镜像元数据（标签）
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          # 双目标仓库: GHCR(给懂的用户) + Docker Hub(普通用户默认地址, 国内加速源都支持)
+          # 第二行 Docker Hub 的地址只有配置了 DOCKERHUB_USERNAME 才会真正生成标签, 否则是空字符串会被忽略
+          images: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+            ${{ secrets.DOCKERHUB_USERNAME != '' && format('docker.io/{0}/{1}', secrets.DOCKERHUB_USERNAME, env.IMAGE_NAME) || '' }}
           tags: |
             # tag=v1.2.3 → 镜像标签 1.2.3
             type=semver,pattern={{version}}
