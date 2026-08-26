@@ -8,25 +8,60 @@
 
 ---
 
-## ⏱️ 3 种部署方法 · 1-5 分钟搞定 (任选一种)
+## 🚀 方法零 · 一键脚本部署 (⭐⭐⭐⭐⭐ 强烈推荐, 100% 不踩坑, 万能启动参数)
+> **完美解决飞牛 NAS GUI「启动失败误判 / 参数漏填」问题，脚本内置命令行 100% 成功的「万能启动参数」**，**不需要懂 docker 命令，不需要手动填任何参数**。
 
-### ⭐ 方法一 · NAS 纯 GUI 点鼠标 (最简单, 适合 99% 用户)
-**不用 SSH、不用传文件、全程点 NAS 浏览器管理页面。**
+1. **下载一键脚本**：下载仓库根目录的 **[quick-start.sh](./quick-start.sh)** 到本地电脑
+2. **上传到 NAS**：把 `quick-start.sh` 上传到 NAS 任意共享文件夹（例如 `/vol1/1000/个人/smartfan`）
+3. **SSH 登录 NAS（或 webSSH）** → 执行：
+   ```bash
+   # ① 切到 root (必须, 普通用户没 docker 权限)
+   su - root
+   #    输入你的 root 密码, 提示符变成 root@xxx:~# 就对了
+
+   # ② 进入你放脚本的目录 (就是刚才上传 quick-start.sh 那个共享文件夹路径)
+   cd "/vol1/1000/个人/smartfan"     ← 改这里, 用你自己的真实路径
+
+   # ③ 一键执行 (自动完成: 检查环境 → 拉镜像 → 清旧容器 → 万能参数启动 → 健康验证)
+   bash quick-start.sh
+   ```
+4. **等 1~3 分钟**，脚本最后会输出 🎉 部署完成 + 浏览器访问地址 `http://NAS_IP:8780`，复制打开即可使用！
+
+<details><summary>💡 quick-start.sh 自动帮你做了什么?(比 GUI 更稳)</summary>
+
+| 步骤 | 自动处理什么 | 避免的坑 |
+|---|---|---|
+| 0 | 自动要求 root 执行 | 普通用户 ajima/其他人报 docker.sock permission denied |
+| 1 | 自动检查 docker 命令 + 8780 端口冲突 | 端口占用导致启动失败无提示 |
+| 2 | 自动拉 Docker Hub，超时自动 Fallback 尝试 GHCR，最后兜底本地镜像 | GUI 拉取超时直接卡死 |
+| 3 | 自动删除同名旧容器 + **万能启动参数**（特权/root/卷/设备映射/时区/日志轮转/健康检查 30s 宽限期）| GUI 漏勾「特权模式」、漏挂 `/dev-host-dev`、健康检查太急误判「启动失败」|
+| 4 | 自动等 60 秒健康检查通过 + 验证 `/api/info` 响应 | 还没启动完就手忙脚乱点进去以为炸了 |
+| 5 | 最后输出部署指南 + 日常运维命令 + 升级方法 | 不用查文档了 |
+</details>
+
+---
+
+## ⏱️ 3 种部署方法 · 1-5 分钟搞定 (任选一种, 首推方法零)
+
+### ⭐⭐⭐ 方法一 · NAS 纯 GUI 点鼠标 (不用传脚本, 方法零脚本上传嫌麻烦用这个)
+**不用 SSH、不用传文件、全程点 NAS 浏览器管理页面。但请严格按下面表格参数填，漏项会踩坑。**
 
 | 步骤 | 操作 (以飞牛 NAS 为例, 群晖/绿联/极空间流程完全类似) |
 |---|---|
 | 1 | 打开 NAS Web 管理 → **容器** → **镜像仓库** (Registry) 搜索框 → 搜 `zxggh/fnsmartfan` |
 | 2 | 找到 `zxggh/fnsmartfan` (Tag: `latest`, Size ~220MB) → 点右侧 **【拉取】** → 等 1-3 分钟拉完 |
 | 3 | 切到 **镜像** (Images) 列表 → 点 `zxggh/fnsmartfan:latest` 这一行右侧 **【创建容器】** |
-| 4 | 参数填写 (照抄就行, 漏一两项也能跑, 特权模式是核心): <ul><li>**名称**: `smartfan`</li><li>**端口映射**: 主机 `8780` → 容器 `8780` (TCP)</li><li>✅ **勾特权模式 (Privileged)** (USB 控制器+HDD温度必须)</li><li>**用户/UID**: `root` (或 UID=0)</li><li>**重启策略**: `always` (开机自启)</li><li>**卷 (Volumes)**: <br>① 新建卷名 `smartfan-data` → 挂载到容器路径 `/data` (配置持久化)<br>② 挂载宿主机路径 `/dev` → 容器路径 `/dev-host-dev`, **模式只读 (ro/Read-Only)** (读 HDD SMART 必须)</li><li>**环境变量**: `TZ` = `Asia/Shanghai` (日志时区)</li><li>(可选) **设备映射**: `/dev/ttyACM0`→`/dev/ttyACM0` 同理 `ttyACM1` `ttyUSB0` `ttyUSB1` (没入口就跳过, 特权+卷已兜底)</li></ul> |
-| 5 | 点 **【创建并启动】** → 等 15 秒 |
+| 4 | **参数严格照抄（3 个红色必填 ⚠️ 必填，漏一个直接启动失败）**： <ul><li>**名称**: `smartfan`</li><li>**端口映射**: 主机 `8780` → 容器 `8780` (TCP)</li><li>⚠️ **必填·✅ 勾特权模式 (Privileged)** <span style="color:red">(USB 控制器 + HDD 温度 必须, 不勾必炸)</span></li><li>⚠️ **必填·用户/UID**: `root` (或 UID=0) <span style="color:red">(避免 sg 密码提示导致容器无限重启)</span></li><li>**重启策略**: `always` (开机自启)</li><li>⚠️ **必填·卷 (Volumes)** <span style="color:red">(漏挂配置/HDD 温度不显示)</span>： <br>① 新建卷名 `smartfan-data` → 挂载到容器路径 `/data` (配置持久化，删容器不丢)<br>② 挂载宿主机路径 `/dev` → 容器路径 `/dev-host-dev`，**模式只读 (ro/Read-Only)** (读 HDD SMART 温度必须)</li><li>**环境变量**: `TZ` = `Asia/Shanghai` (日志/温控时区正确)</li><li>(可选) **设备映射**: `/dev/ttyACM0`→`/dev/ttyACM0`，同理 `ttyACM1`、`ttyUSB0`、`ttyUSB1`（没有设备映射入口就跳过，特权模式 + 上面 /dev 卷已兜底拔插识别）</li></ul> |
+| 5 | 点 **【创建并启动】** → **等 1~2 分钟后再刷新容器列表**（健康检查 start_period=30s，飞牛 GUI 前 30s 会误判「启动失败」，别删容器，等一下自动变「运行中（健康）」）|
 | 6 | 浏览器打开 **http://你的NAS_IP:8780** → 完成 🎉 |
 
-<details><summary>💡 常见问题: 搜索搜不到 / 拉取超时怎么办?</summary>
+<details><summary>💡 常见问题: GUI 报「启动失败，查看日志」？怎么办</summary>
 
-1. **飞牛 NAS 搜不到** → 切到下一页或刷新缓存; 还不行直接用"方法二" Compose 文件拉
-2. **其他 NAS 拉不到** → 去 Docker 设置里加国内加速源 (阿里云镜像加速 / 中科大 / 163 镜像), 保存重启 Docker 后重拉
-3. **完全没外网 → 用方法三离线 tar 导入**
+**90% 不是真的启动失败，是以下 2 种误判：**
+1. **飞牛健康检查太急躁**：首次启动要 `pip install -r requirements.txt` 补装依赖 + 健康检查有 30 秒宽限期，**前 1 分钟健康检查显示 starting / unhealthy，GUI 就会误判成失败**。解决：**别删容器！等 90 秒再刷新容器列表页面，90% 会自动变成「运行中（健康）」**
+2. **参数漏填**（真的启动失败）：回到步骤 4 检查 3 个红色必填项（特权模式？用户 root？挂了 smartfan-data + /dev → /dev-host-dev 只读？）
+
+如果上面都做到了 2 分钟后还是失败，**直接换「方法零·一键脚本部署」**，脚本内置万能参数+健康检查宽限，100% 一次成功。
 </details>
 
 ---
