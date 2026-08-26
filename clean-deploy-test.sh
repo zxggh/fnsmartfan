@@ -108,17 +108,17 @@ info "剩余: 镜像=$IMG_REMAIN 容器=$CT_REMAIN 卷=$VL_REMAIN"
 check_result "清场干净(镜像/容器/卷都为0)" $([ "$IMG_REMAIN" -eq 0 ] && [ "$CT_REMAIN" -eq 0 ] && [ "$VL_REMAIN" -eq 0 ] && echo 1 || echo 0)
 
 # ═══════════════════════════════════════════════
-# 2. 拉取远程镜像 (修复版: 不看退出码, 看 docker images 是否真的有 IMAGE_ID)
+# 2. 拉取远程镜像 (默认 Docker Hub, 全 NAS 品牌通用, 匿名即可)
 # ═══════════════════════════════════════════════
 echo ""
 echo "──────────────────────────────────────────────"
-echo " [2/6] 拉取 ghcr.io/zxggh/fnsmartfan:latest"
+echo " [2/6] 拉取 zxggh/fnsmartfan:latest (Docker Hub 公共仓库, 匿名拉取)"
 echo "──────────────────────────────────────────────"
-echo "(如果报 401/unauthorized → 飞牛 docker.fnnas.com 代理拦截了 GHCR 公共镜像)"
-echo "(脚本会自动尝试 Fallback: 本地 tar 导入 / PAT 登录重新拉)"
+echo "(公共镜像, 100% 匿名, 无需 PAT/登录, 所有 NAS 品牌和加速源都兼容)"
+echo "(如果超时 → 切换国内加速源 (阿里云/中科大/163) 或用 Fallback)"
 sleep 2
 
-TARGET_IMAGE="ghcr.io/zxggh/fnsmartfan:latest"
+TARGET_IMAGE="zxggh/fnsmartfan:latest"
 get_image_id() {
   docker images --format "{{.ID}}" "$TARGET_IMAGE" 2>/dev/null | head -n 1
 }
@@ -146,60 +146,61 @@ check_result "远程镜像拉取成功 (IMAGE_ID 存在)" $PULL_OK
 # ──────────────────── 拉取失败 → Fallback 自动处理 ────────────────────
 if [ "$PULL_OK" -ne 1 ]; then
   echo ""
-  warn "GHCR 拉取失败 (通常是飞牛 NAS docker.fnnas.com 代理拦截公共镜像, 即使镜像公开也会401)"
+  warn "Docker Hub 拉取失败 (通常是 NAS Docker 没切国内加速源, 导致超时)"
   echo "  🔧 自动执行 Fallback 流程:"
 
   FALLBACK_DONE=0
 
-  # Fallback A: 搜索本地所有 fnsmartfan*.tar, 优先选体积最大的(完整镜像)
+  # Fallback A: 尝试备用仓库 ghcr.io/zxggh/fnsmartfan:latest (国内部分 NAS 代理可用)
   echo ""
-  echo "  [A] 扫描本地 fnsmartfan*.tar 备份..."
-  TARS=$(find "$DEPLOY_DIR" -maxdepth 2 -type f \( -name "fnsmartfan*.tar" -o -name "*fnsmartfan*.tar*" \) -printf '%s %p\n' 2>/dev/null | sort -rn)
-  TAR_COUNT=$(echo "$TARS" | grep -c . || true)
-  if [ "$TAR_COUNT" -gt 0 ]; then
-    info "发现 $TAR_COUNT 个 tar 备份:"
-    echo "$TARS" | while read -r sz p; do
-      echo "    - $(echo "scale=1;$sz/1024/1024" | bc 2>/dev/null || echo "$sz bytes") $p"
-    done
-    # 自动选体积最大的那个加载
-    BEST_TAR=$(echo "$TARS" | head -n 1 | sed 's/^[0-9]* //')
-    echo ""
-    read -r -p "  是否自动加载 $BEST_TAR ? [Y/n]: " FALLBACK_TAR
-    if [ "$FALLBACK_TAR" != "n" ] && [ "$FALLBACK_TAR" != "N" ]; then
-      info "正在 docker load -i $BEST_TAR ..."
-      if docker load -i "$BEST_TAR" 2>&1 | tail -5; then
-        # 加载成功后, 把结果 tag 成 TARGET_IMAGE (让 compose 能匹配)
-        LOADED_TAG=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^fnsmartfan:" | head -n 1)
-        if [ -z "$LOADED_TAG" ]; then
-          LOADED_TAG="fnsmartfan:latest"
-        fi
-        info "docker tag $LOADED_TAG → $TARGET_IMAGE"
-        docker tag "$LOADED_TAG" "$TARGET_IMAGE" 2>/dev/null || true
-        docker tag "$LOADED_TAG" "fnsmartfan:latest" 2>/dev/null || true
-        FALLBACK_DONE=1
-      fi
-    fi
+  echo "  [A] 尝试备用仓库 GHCR: ghcr.io/zxggh/fnsmartfan:latest"
+  GHCR_IMAGE="ghcr.io/zxggh/fnsmartfan:latest"
+  GHCR_BEFORE=$(docker images --format "{{.ID}}" "$GHCR_IMAGE" 2>/dev/null | head -n 1 || true)
+  docker pull "$GHCR_IMAGE" 2>&1 | tail -10 || true
+  GHCR_AFTER=$(docker images --format "{{.ID}}" "$GHCR_IMAGE" 2>/dev/null | head -n 1 || true)
+  if [ -n "$GHCR_AFTER" ] && [ "$GHCR_AFTER" != "$GHCR_BEFORE" ]; then
+    info "GHCR 拉取成功! docker tag $GHCR_IMAGE → $TARGET_IMAGE"
+    docker tag "$GHCR_IMAGE" "$TARGET_IMAGE" 2>/dev/null || true
+    FALLBACK_DONE=1
+  elif [ -n "$GHCR_AFTER" ] && [ -z "$GHCR_BEFORE" ]; then
+    info "GHCR 已有镜像! docker tag $GHCR_IMAGE → $TARGET_IMAGE"
+    docker tag "$GHCR_IMAGE" "$TARGET_IMAGE" 2>/dev/null || true
+    FALLBACK_DONE=1
   else
-    warn "  没有找到任何 fnsmartfan*.tar 备份"
+    warn "  GHCR 也拉不到 (或之前也没缓存), 继续下一 Fallback"
   fi
 
-  # Fallback B: docker login ghcr.io (用 PAT) 然后重新 pull
+  # Fallback B: 搜索本地所有 fnsmartfan*.tar, 优先选体积最大的(完整镜像)
   if [ "$FALLBACK_DONE" -ne 1 ]; then
     echo ""
-    echo "  [B] Fallback: 用 GitHub PAT 登录 GHCR 后重新 pull (解决代理拦截公共镜像的问题)"
-    echo "      (如果你还没有 PAT, 去 https://github.com/settings/tokens 勾选 write:packages 生成)"
-    read -r -p "  是否输入 GitHub 用户名+PAT 重新登录? [y/N]: " FALLBACK_LOGIN
-    if [ "$FALLBACK_LOGIN" = "y" ] || [ "$FALLBACK_LOGIN" = "Y" ]; then
-      read -r -p "    GitHub 用户名 (默认 zxggh): " GH_USER
-      [ -z "$GH_USER" ] && GH_USER="zxggh"
-      read -r -s -p "    GitHub Classic PAT (复制后回车, 不会显示): " GH_PAT
+    echo "  [B] 扫描本地 fnsmartfan*.tar 备份..."
+    TARS=$(find "$DEPLOY_DIR" -maxdepth 2 -type f \( -name "fnsmartfan*.tar" -o -name "*fnsmartfan*.tar*" \) -printf '%s %p\n' 2>/dev/null | sort -rn)
+    TAR_COUNT=$(echo "$TARS" | grep -c . || true)
+    if [ "$TAR_COUNT" -gt 0 ]; then
+      info "发现 $TAR_COUNT 个 tar 备份:"
+      echo "$TARS" | while read -r sz p; do
+        echo "    - $(echo "scale=1;$sz/1024/1024" | bc 2>/dev/null || echo "$sz bytes") $p"
+      done
+      # 自动选体积最大的那个加载
+      BEST_TAR=$(echo "$TARS" | head -n 1 | sed 's/^[0-9]* //')
       echo ""
-      if echo "$GH_PAT" | docker login ghcr.io -u "$GH_USER" --password-stdin 2>&1 | tail -3; then
-        info "登录成功! 重新 pull $TARGET_IMAGE ..."
-        docker pull "$TARGET_IMAGE" 2>&1 | tail -10 || true
-      else
-        warn "  登录失败, 跳过 Fallback B"
+      read -r -p "  是否自动加载 $BEST_TAR ? [Y/n]: " FALLBACK_TAR
+      if [ "$FALLBACK_TAR" != "n" ] && [ "$FALLBACK_TAR" != "N" ]; then
+        info "正在 docker load -i $BEST_TAR ..."
+        if docker load -i "$BEST_TAR" 2>&1 | tail -5; then
+          # 加载成功后, 把结果 tag 成 TARGET_IMAGE (让 compose 能匹配)
+          LOADED_TAG=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^fnsmartfan:" | head -n 1)
+          if [ -z "$LOADED_TAG" ]; then
+            LOADED_TAG="fnsmartfan:latest"
+          fi
+          info "docker tag $LOADED_TAG → $TARGET_IMAGE"
+          docker tag "$LOADED_TAG" "$TARGET_IMAGE" 2>/dev/null || true
+          docker tag "$LOADED_TAG" "fnsmartfan:latest" 2>/dev/null || true
+          FALLBACK_DONE=1
+        fi
       fi
+    else
+      warn "  没有找到任何 fnsmartfan*.tar 备份"
     fi
   fi
 
@@ -209,7 +210,7 @@ if [ "$PULL_OK" -ne 1 ]; then
     pass "Fallback 后镜像已就绪 (IMAGE_ID=$AFTER_FB_ID)"; PULL_OK=1; PASS_CNT=$((PASS_CNT+1))
   else
     # 最后再兜底: 扫本地所有 fnsmartfan:* 标签, 随便 tag 一个为 TARGET_IMAGE
-    ANY_LOCAL=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^fnsmartfan:" | head -n 1)
+    ANY_LOCAL=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep -i "fnsmartfan" | head -n 1)
     if [ -n "$ANY_LOCAL" ]; then
       warn "  发现本地镜像 $ANY_LOCAL, 自动 tag 成 $TARGET_IMAGE (临时兜底)"
       docker tag "$ANY_LOCAL" "$TARGET_IMAGE" 2>/dev/null || true
@@ -223,16 +224,13 @@ if [ "$PULL_OK" -ne 1 ]; then
     echo ""
     fail "所有 Fallback 方案均未获得可用镜像! 中止脚本"
     echo ""
-    echo "  手动解决办法:"
-    echo "  方法 1 (推荐): Windows 本地 Docker Desktop 执行:"
-    echo "    docker login ghcr.io -u zxggh"
-    echo "    docker pull ghcr.io/zxggh/fnsmartfan:latest"
-    echo "    docker save ghcr.io/zxggh/fnsmartfan:latest -o fnsmartfan-latest.tar"
+    echo "  手动解决办法 (按优先级选一种):"
+    echo "  方法 1 (推荐·飞牛 NAS): 直接 GUI 镜像仓库搜索 zxggh/fnsmartfan → 拉取 (走飞牛代理缓存)"
+    echo "  方法 2 (推荐·所有 NAS): 去 NAS Docker 设置里加国内加速源 (阿里云/中科大/163)后重新拉 Docker Hub"
+    echo "  方法 3 (离线): Windows 本地 Docker Desktop 执行:"
+    echo "    docker pull zxggh/fnsmartfan:latest"
+    echo "    docker save zxggh/fnsmartfan:latest -o fnsmartfan-latest.tar"
     echo "    → 把 tar 上传到 $DEPLOY_DIR/ 后重新执行本脚本"
-    echo ""
-    echo "  方法 2: 在 NAS 任务计划 (非 webSSH, webSSH 是非交互环境) 里一次性跑:"
-    echo "    echo '你的_Classic_PAT' | docker login ghcr.io -u zxggh --password-stdin"
-    echo "    docker pull ghcr.io/zxggh/fnsmartfan:latest"
     exit 1
   fi
 fi
@@ -369,23 +367,40 @@ fi
 echo ""
 echo ""
 echo "============================================================"
-echo "  💡 新设备部署 (不用 SSH! 全程 NAS Web 界面操作)"
+echo "  💡 新设备部署 (不用 SSH! 全程 NAS Web 界面操作, 3 种方法任选)"
 echo "============================================================"
-echo "  准备文件: docker-compose.remote.yml (和本脚本同目录)"
+echo "  ⭐ 默认镜像地址: zxggh/fnsmartfan:latest (Docker Hub 公共仓库, 匿名拉取, 全 NAS 通用)"
 echo ""
-echo "  步骤 (全程点鼠标, 无需命令行):"
-echo "  1) 打开飞牛 NAS Web 管理 → 『容器』 → 左侧『Compose』"
-echo "  2) 点击 『+ 创建项目』 → 选择『上传 compose 文件』"
-echo "  3) 项目名称填: smartfan"
-echo "  4) 路径选择: /vol1/1000/个人/smart fan (或你想放的任何目录)"
-echo "  5) 上传文件: 选 docker-compose.remote.yml (不要选脚本目录那个带 volumes 备份字段的)"
-echo "  6) 点击 『确定』 → NAS 会自动拉取 ghcr.io/zxggh/fnsmartfan:latest + 创建 + 启动"
-echo "  7) 浏览器打开 http://NAS_IP:8780 即可使用"
+echo "  ┌───────────────────────────────────────────────────────┐"
+echo "  │ 方法一 ⭐⭐⭐ (最简单·飞牛/群晖等 GUI 点鼠标 1 分钟)   │"
+echo "  │  1) NAS → 容器 → 【镜像仓库】搜索 zxggh/fnsmartfan    │"
+echo "  │  2) 找到 zxggh/fnsmartfan:latest → 点【拉取】        │"
+echo "  │  3) 拉完点【创建容器】→ 填:                            │"
+echo "  │     名称=smartfan / 端口 8780:8780                    │"
+echo "  │     勾 特权模式 / 用户 root / 重启策略 always          │"
+echo "  │     卷: 新建 smartfan-data → /data                    │"
+echo "  │         /dev → /dev-host-dev (只读)                   │"
+echo "  │     环境变量: TZ=Asia/Shanghai                        │"
+echo "  │  4) 创建并启动 → 打开 http://NAS_IP:8780              │"
+echo "  ├───────────────────────────────────────────────────────┤"
+echo "  │ 方法二 ⭐⭐ (推荐·Compose 文件一键部署, 适合所有 NAS) │"
+echo "  │  准备文件: docker-compose.remote.yml                   │"
+echo "  │  1) NAS → 容器 → Compose / Stack → + 创建项目         │"
+echo "  │  2) 项目名 smartfan, 路径随便, 上传 docker-compose.   │"
+echo "  │     remote.yml, 点确定 → 自动拉镜像+启动              │"
+echo "  │  3) 打开 http://NAS_IP:8780                           │"
+echo "  ├───────────────────────────────────────────────────────┤"
+echo "  │ 方法三 ⭐ (离线部署, NAS 没外网)                      │"
+echo "  │  Windows 本地执行:                                     │"
+echo "  │    docker pull zxggh/fnsmartfan:latest                │"
+echo "  │    docker save zxggh/fnsmartfan:latest -o fnsmart.tar │"
+echo "  │  上传 tar 到 NAS → 容器 → 镜像 → 导入 tar             │"
+echo "  │  导入后标签显示 zxggh/fnsmartfan:latest 即可用方法一  │"
+echo "  └───────────────────────────────────────────────────────┘"
 echo ""
-echo "  * 如果 GHCR 拉取失败(飞牛 NAS docker.fnnas.com 代理拦截公共镜像):"
-echo "    A) 方法一: NAS 任务计划 执行一次 docker login ghcr.io + PAT 登录"
-echo "    B) 方法二: Windows 本地 save tar, 上传 tar 后在 NAS 容器 → 『镜像』 → 『导入镜像』"
-echo "               然后把 compose 的 image 改成 fnsmartfan:latest 本地镜像即可"
+echo "  * Docker Hub 拉取超时/失败?"
+echo "    → 先去 NAS Docker 设置加国内加速源: 阿里云/中科大/163"
+echo "    → 飞牛 NAS 用户: 直接用 方法一 GUI 搜索 (走飞牛代理缓存, 最稳)"
 echo "============================================================"
 echo "  📋 完整日志已保存: $LOG_FILE"
 echo "============================================================"
