@@ -18,8 +18,8 @@ permissions:
   packages: write
 
 env:
-  # 镜像名（会自动拼成 ghcr.io/<仓库所有者>/smartfan:标签）
-  IMAGE_NAME: smartfan
+  # 镜像名（会自动拼成 ghcr.io/<仓库所有者>/fnsmartfan:标签）
+  IMAGE_NAME: fnsmartfan
 
 jobs:
   build-and-push:
