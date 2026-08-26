@@ -1,0 +1,81 @@
+# ============================================================
+# SmartFan 智能风扇控制器 - 【新设备一键部署专用 Compose 文件】
+#
+# 用途: 拿到一台从未装过 SmartFan 的全新飞牛 NAS, 直接上传本文件到
+#       NAS 容器 Compose 界面, 不用 SSH, 不用改一行, 点确定即可部署
+#
+# 使用方法(全程 NAS Web 界面, 无需命令行):
+#   1. 打开飞牛 NAS Web 管理 → 容器 → 左侧菜单点 Compose
+#   2. 点右上角 【+ 创建项目】
+#   3. 项目名称填: smartfan (随意, 建议保持这个方便辨识)
+#   4. 【路径】选择你放文件的目录, 例如 /vol1/1000/个人/smart fan
+#   5. 【文件上传模式】选择本文件 (docker-compose.remote.yml)
+#   6. 点【确定】, NAS 会自动:
+#      → 拉取 ghcr.io/zxggh/fnsmartfan:latest
+#      → 创建 smartfan-data 数据卷(存放配置, 容器删了也不丢)
+#      → 启动容器并加入开机自启
+#   7. 浏览器打开 http://NAS_IP:8780 就能看到 Web UI
+#
+# 常见问题:
+#   ❓ GHCR 公共镜像拉取失败(401 denied/manifest unknown):
+#      → 原因: 飞牛 NAS dockerd 默认走 docker.fnnas.com 代理, 公共镜像偶尔也被拦截
+#      → 解决 A (推荐): NAS 任务计划里跑一次 docker login ghcr.io 用 GitHub PAT 登录
+#      → 解决 B (离线): Windows 本地拉取后 save tar → NAS 镜像 → 导入 → 把 image 改成 fnsmartfan:latest
+# ============================================================
+
+services:
+  smartfan:
+    container_name: smartfan
+
+    # ↓↓↓ 远程镜像地址 (GitHub Actions 每次提交代码后自动构建更新) ↓↓↓
+    image: ghcr.io/zxggh/fnsmartfan:latest
+
+    # 开机自启
+    restart: always
+
+    # Web UI 端口: NAS_IP:8780
+    ports:
+      - "8780:8780"
+
+    # ── USB 控制器 + HDD 温度访问权限 ──
+    # 特权模式 + 显式设备映射 + 宿主机整个 /dev 挂载(3 保险)
+    # 这样控制器随便拔插端口、HDD 用 smartctl 读温度都能正常工作
+    privileged: true
+    devices:
+      - "/dev/ttyACM0:/dev/ttyACM0"
+      - "/dev/ttyACM1:/dev/ttyACM1"
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+      - "/dev/ttyUSB1:/dev/ttyUSB1"
+    volumes:
+      # 1) 数据卷: 存放 config.yaml + 开关状态 + 断连日志, 容器重建不丢失
+      - smartfan-data:/data
+      # 2) 宿主机 /dev → 容器 /dev-host-dev (只读)
+      #    容器里 smartctl 通过 /dev-host-dev/sd* 读取宿主机硬盘 SMART 温度
+      #    拔插 USB 后 /dev-host-dev/ttyACM* 也自动同步, 不用重启容器
+      - /dev:/dev-host-dev:ro
+
+    # root 用户: 跳过 sg dialout/sg disk 密码提示, 串口和 SMART 权限兜底
+    user: root
+
+    # 时区 (上海, 日志时间与 NAS 系统一致)
+    environment:
+      - TZ=Asia/Shanghai
+
+    # 健康检查: 30 秒一次 API 检测, 连续失败 3 次标记 unhealthy
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-m", "3", "http://127.0.0.1:8780/api/info"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # 日志轮转: 单文件 10MB, 最多 5 份, 防止占满磁盘
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  smartfan-data:
+    driver: local

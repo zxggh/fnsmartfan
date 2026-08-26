@@ -7,9 +7,9 @@
 #   ✅ 完全不用再导入/导出 tar，更新就两步：Push → NAS 点"重新拉取+重启"
 #
 # ⚠ 当前仓库真实镜像地址（Actions 构建成功后自动推送）：
-#    主镜像 (GHCR) : ghcr.io/zxggh/fnsmartfan:latest
-#    DockerHub     : docker.io/<你的用户名>/fnsmartfan:latest
-#    私有镜像      : registry.example.com/<你的用户名>/fnsmartfan:latest
+#    主镜像 (GHCR) : ghcr.io/zxggh/fnsmartfan:latest  ✅ 2026-08-26 起已启用
+#    DockerHub     : (未配置, 需要的话自己改 workflow 加 docker.io 登录)
+#    本地离线镜像  : fnsmartfan:v2 / fnsmartfan:golden (docker commit 后使用)
 # ============================================================
 
 services:
@@ -17,12 +17,10 @@ services:
     container_name: smartfan
 
     # ============================================================
-    # 远程镜像地址：
-    #   先用 smartfan（已存在、立刻能拉），等 Actions 重新构建出 fnsmartfan
-    #   后再改回 fnsmartfan 一行
+    # 远程镜像地址（GitHub Actions 构建 → ghcr.io/zxggh/fnsmartfan:latest）
+    # 如需切本地镜像: image: fnsmartfan:v2
     # ============================================================
-    image: ghcr.io/zxggh/smartfan:latest
-    # image: ghcr.io/zxggh/fnsmartfan:latest
+    image: ghcr.io/zxggh/fnsmartfan:latest
 
     # ============================================================
     # ⚠ 本镜像内置的 entrypoint 会：
