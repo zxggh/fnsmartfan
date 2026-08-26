@@ -66,7 +66,10 @@ RUN python3 -m venv --system-site-packages /app/venv 2>/dev/null \
  || python3 -m venv /app/venv
 
 # 安装 Python 依赖（使用国内清华 PyPI 镜像源加速）
+# 注意：优先读项目自带 requirements.txt，缺失的包再单独补充
 RUN /app/venv/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -r /app/requirements.txt 2>/dev/null || true \
+ && /app/venv/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     pyserial-asyncio fastapi uvicorn
 
 # 确保启动脚本有执行权限
@@ -76,6 +79,12 @@ RUN chmod +x /app/start.sh 2>/dev/null || true
 RUN groupadd -r dialout 2>/dev/null || true \
  && useradd -r -u 1000 -G dialout fanuser \
  && chown -R fanuser:fanuser /app
+
+# ============================================================
+# 调试辅助：构建阶段列出 /app 内容，方便确认解压结果
+# 如果启动时找不到 start.sh，看构建日志里这一段就能排错
+# ============================================================
+RUN echo "--- /app contents after build ---" && ls -la /app && echo "--- start.sh exists:" && cat /app/start.sh 2>/dev/null | head -50 || echo "start.sh missing"
 
 # 切换到普通用户
 USER fanuser
@@ -87,5 +96,20 @@ EXPOSE 8780
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -s -m 3 http://127.0.0.1:8780/api/info >/dev/null 2>&1 || exit 1
 
-# 启动命令：使用虚拟环境中的 Python 运行 start.sh
-CMD ["bash", "-c", "cd /app && ./start.sh"]
+# 启动命令：
+# 1) 空卷初始化：把 /app/config.yaml 模板拷到 /data（如果卷里还没有）
+# 2) 将 /app/config.yaml 软链到 /data/config.yaml，保证配置在容器重建后保留
+# 3) 用 root 用户 + --privileged 已经足够访问串口，跳过 sg dialout/sg disk
+#    （原 start.sh 里的嵌套 sg 会在非 TTY 环境索要密码 → 容器死循环重启）
+# 4) 首次启动时补装项目 requirements（兼容老镜像缺少 PyYAML 的问题）
+CMD ["bash", "-c", "\
+set -e && \
+cd /app && \
+if [ ! -f /data/config.yaml ] && [ -f /app/config.yaml ]; then \
+  mkdir -p /data && cp /app/config.yaml /data/config.yaml; \
+fi && \
+rm -f /app/config.yaml && ln -sf /data/config.yaml /app/config.yaml && \
+/app/venv/bin/pip install --quiet --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  -r /app/requirements.txt PyYAML pyserial pyserial-asyncio fastapi uvicorn schedule \
+  || true && \
+exec /app/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8780 --log-level info"]

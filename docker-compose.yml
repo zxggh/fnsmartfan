@@ -17,22 +17,20 @@ services:
     container_name: smartfan
 
     # ============================================================
-    # 远程镜像地址：默认已填好本仓库 GHCR 地址
-    # 只保留一条，其它注释掉
+    # 远程镜像地址：
+    #   先用 smartfan（已存在、立刻能拉），等 Actions 重新构建出 fnsmartfan
+    #   后再改回 fnsmartfan 一行
     # ============================================================
-    image: ghcr.io/zxggh/fnsmartfan:latest
-    # image: docker.io/<你的用户名>/fnsmartfan:latest
-    # image: smartfan:latest   ← 纯本地离线模式（需要先 docker load tar）
+    image: ghcr.io/zxggh/smartfan:latest
+    # image: ghcr.io/zxggh/fnsmartfan:latest
 
     # ============================================================
-    # 启动时是否自动拉取最新镜像
-    #   always : 每次启动容器前都拉一次（保证最新，但可能慢几秒）
-    #   never  : 只拉已经在本地的，完全不碰网络（离线/防401用）
-    #   missing: 本地没有时才拉（默认行为，飞牛 Compose 版本太老不支持
-    #            pull_policy 字段时，请注释掉整段，改为手动在 NAS 界面
-    #            容器 → 镜像 → 拉取镜像 填写完整地址拉取）
+    # ⚠ 本镜像内置的 entrypoint 会：
+    #   - 启动时自动把 requirements 装到镜像层的 venv
+    #   - 自动从 /data 卷接管 config.yaml（空卷时自动拷贝模板）
+    # 所以这里不要覆盖 entrypoint，直接用默认启动即可
     # ============================================================
-    # pull_policy: always
+    # entrypoint: bash -c "..."
 
     # 自动重启
     restart: always
@@ -44,9 +42,13 @@ services:
     # USB 串口：特权模式自动识别 /dev/ttyACM*
     privileged: true
 
-    # 数据持久化卷
+    # 用 root 用户运行，避免 sg dialout / 串口权限、/data 卷权限各种问题
+    user: root
+
+    # 数据持久化卷（⚠ 只挂 /data，不要挂 /app，
+    # 否则会把镜像里带依赖的 venv 覆盖掉导致 yaml 等包缺失）
     volumes:
-      - smartfan-data:/app
+      - smartfan-data:/data
 
     # 时区
     environment:
@@ -58,7 +60,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 30s
 
     # 日志限制
     logging:
