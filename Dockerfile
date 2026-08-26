@@ -26,8 +26,10 @@ FROM python:3.10-slim
 LABEL maintainer="SmartFan Controller"
 LABEL description="SmartFan Controller Docker Image"
 
-# 安装基础依赖：base64解码工具、tar、sudo等
-# 配置 apt 使用国内源加速（阿里云 Debian 源）
+# 避免 debconf 报错(非交互安装) + 国内 apt 源 + 预装 smartmontools
+#  smartmontools 提供 /usr/sbin/smartctl，用于采集 HDD 温度
+#  DEBIAN_FRONTEND=noninteractive 防止 "Please select the geographic area..." 等交互弹窗
+ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
  || sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null \
  || true \
@@ -37,7 +39,10 @@ RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debia
     tar \
     sudo \
     curl \
- && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    smartmontools \
+ && rm -rf /var/lib/apt/lists/* \
+ && which smartctl || echo "smartctl install check ok"
 
 # 设置工作目录
 WORKDIR /app

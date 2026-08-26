@@ -40,15 +40,23 @@ services:
       - "8780:8780"
 
     # USB 串口：特权模式自动识别 /dev/ttyACM*
+    # 注意：飞牛 NAS 的 Docker 在 privileged 模式下仍可能不会自动映射 USB 设备，
+    #       下面显式把常见串口设备透传进容器；如果你拔插后节点变了（比如变成 ttyACM1），
+    #       把下面对应那一行改一下再 up 即可。
     privileged: true
+    devices:
+      - "/dev/ttyACM0:/dev/ttyACM0"
+      - "/dev/ttyACM1:/dev/ttyACM1"
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+      - "/dev/ttyUSB1:/dev/ttyUSB1"
+    # 兜底：如果 devices 还不够，把宿主机整个 /dev 挂到容器里，保证所有串口都能看到
+    #       （建议保留，即使有 devices 时也不冲突，飞牛 NAS 上实测非常有用）
+    volumes:
+      - smartfan-data:/data
+      - /dev:/dev-host-dev:ro
 
     # 用 root 用户运行，避免 sg dialout / 串口权限、/data 卷权限各种问题
     user: root
-
-    # 数据持久化卷（⚠ 只挂 /data，不要挂 /app，
-    # 否则会把镜像里带依赖的 venv 覆盖掉导致 yaml 等包缺失）
-    volumes:
-      - smartfan-data:/data
 
     # 时区
     environment:

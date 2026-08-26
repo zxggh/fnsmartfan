@@ -40,3 +40,6 @@ desktop.ini
 # ========== 临时文件 ==========
 *.tmp
 *.temp
+# 本地临时解压工作区 & 补丁副本 (仓库以 smartfan-install.sh BASE64 为准)
+temp_work/
+修改后文件_*/
