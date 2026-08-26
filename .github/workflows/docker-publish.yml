@@ -20,6 +20,9 @@ permissions:
 env:
   # 镜像名（会自动拼成 ghcr.io/<仓库所有者>/fnsmartfan:标签 以及 docker.io/<用户>/fnsmartfan:标签）
   IMAGE_NAME: fnsmartfan
+  # 消除 Node.js 20 deprecation warning (GitHub 2025-09 起强制旧 actions 跑 Node 24)
+  # 详情: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-push:
