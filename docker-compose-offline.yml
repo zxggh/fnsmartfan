@@ -1,52 +1,61 @@
-# ============================================================
-# SmartFan 智能风扇控制器 — 飞牛 NAS docker compose 一键启动
+# SmartFan 智能风扇控制器 — Docker Compose 部署 (离线/内网用)
 #
-# 使用方法 (SSH 登录飞牛 NAS 后执行, 必须 root):
-#   1) 把本文件放到任意目录 (例如 /vol1/1000/docker/smartfan-fix/)
-#   2) docker compose -f docker-compose-offline.yml up -d
-#   3) 等 1~2 分钟, 浏览器打开 http://NAS-IP:8780
+# 用法 (飞牛/FnOS/NAS, root):
+#   ① 把本文件上传到 NAS 任意目录
+#   ② su - root
+#   ③ cd 到该目录
+#   ④ docker compose -f docker-compose-offline.yml pull      # 拉最新镜像
+#   ⑤ docker compose -f docker-compose-offline.yml up -d     # 后台启动
+#   ⑥ 等 30~90 秒 → docker compose -f docker-compose-offline.yml ps  # 看 healthy
 #
-# 特性:
-#   ✓ 所有参数齐全: root + privileged + /dev 映射 + 卷
-#   ✓ 健康检查 start-period=90s, 不会误判启动失败
-#   ✓ 日志 10M×5 限制, 不撑爆硬盘
-#   ✓ 容器重建自动创建 smartfan-data 卷, 配置持久化
-# ============================================================
+# 说明:
+#   - 所有参数与 DEPLOY.md 的「一行版 docker run」等价
+#   - 已经包含: root 用户 / 特权模式 / 串口 device 兜底 / /dev 全映射 /
+#               smartfan-data 持久化卷 / TZ 时区 / 90 秒健康检查宽限 /
+#               日志轮转 (10m × 5 份, 不撑爆 NAS 盘)
+#   - 如果 8780 端口被占用, 改 ports: 的第一个数字即可 (例 8781:8780)
 
 services:
   smartfan:
     image: zxggh/fnsmartfan:latest
     container_name: smartfan
-    user: "root"                 # NAS 串口/卷必须 root
-    privileged: true             # 特权模式, 自动访问所有 /dev 设备
-    restart: always              # NAS 重启自动拉起
-    ports:
-      - "8780:8780"              # Web 控制台端口
+    restart: always
+    user: "root"                 # NAS 环境必须, 否则串口和 /data 卷无权
+    privileged: true             # 自动获得所有 ttyUSB/ttyACM 设备权限
     environment:
-      - TZ=Asia/Shanghai
+      TZ: Asia/Shanghai          # 时间同步, 曲线 X 轴时间正确
+      LANG: C.UTF-8
+    ports:
+      - "8780:8780/tcp"          # 改左边第一个数字即可换端口 (例 8781:8780)
     volumes:
-      # 持久化配置 + 温度历史 (容器重建不丢数据)
-      - smartfan-data:/data
-      # 映射整个 /dev 目录 (privileged 下控制器 USB 串口直接可用)
-      - /dev:/dev:rw
+      - smartfan-data:/data      # 持久化: 配置 / 温度历史 / 断连日志
+      - /dev:/dev:rw             # 所有硬件设备映射 (USB 串口控制器必备)
+    # 4 个常见串口 device 兜底 (有些 NAS privileged=true 下仍需显式声明)
     devices:
-      # 兜底: 即使没 privileged, 常用串口也直接映射 (都不存在也不报错)
       - /dev/ttyUSB0:/dev/ttyUSB0
       - /dev/ttyUSB1:/dev/ttyUSB1
       - /dev/ttyACM0:/dev/ttyACM0
       - /dev/ttyACM1:/dev/ttyACM1
+    # 健康检查: 调宽 start-period 避免飞牛 GUI 误判「启动失败」
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -m 3 http://127.0.0.1:8780/api/info >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 90s         # 首次启动 90 秒内不判失败 (给 pip install 留时间)
+    # 日志限制: 防止 NAS 盘被日志撑满
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
-    healthcheck:
-      test: ["CMD", "curl", "-s", "-m", "3", "http://127.0.0.1:8780/api/info"]
-      interval: 20s
-      timeout: 5s
-      start_period: 90s        # 首次启动 pip install 约 30~60s
-      retries: 5
+    networks:
+      - smartfan-net
 
 volumes:
-  smartfan-data:
+  smartfan-data:                # 自动创建命名卷, 升级容器不丢数据
     name: smartfan-data
+
+networks:
+  smartfan-net:
+    driver: bridge

@@ -1,215 +1,216 @@
-# SmartFan 智能风扇控制器 · 公共部署指南
+# SmartFan 智能风扇控制器 — 部署文档 (v6 最新)
 
-> 默认镜像: **`zxggh/fnsmartfan:latest`** (Docker Hub 公共仓库, **匿名拉取, 无需 PAT/登录, 所有 NAS 品牌通用**)
->
-> 备用镜像: `ghcr.io/zxggh/fnsmartfan:latest` (GHCR, 国内部分 NAS 可切换到此)
->
-> 锁死版本: `zxggh/fnsmartfan:2.2.0` (每次升级需手动改 tag, 适合生产环境求稳)
+> 适用版本：≥ commit `c9d5716`（含 NAS 部署坑修复 + 温度历史功能）  
+> 控制器固件：≥ v6（USB CDC 死锁检测 + NTC 温度基准同步）
 
 ---
 
-## 🚀 方法零 · 一键脚本部署 (⭐⭐⭐⭐⭐ 强烈推荐, 100% 不踩坑, 万能启动参数)
-> **完美解决飞牛 NAS GUI「启动失败误判 / 参数漏填」问题，脚本内置命令行 100% 成功的「万能启动参数」**，**不需要懂 docker 命令，不需要手动填任何参数**。
+## 🎯 部署方式推荐顺序（从稳 → 折腾）
 
-1. **下载一键脚本**：下载仓库根目录的 **[quick-start.sh](./quick-start.sh)** 到本地电脑
-2. **上传到 NAS**：把 `quick-start.sh` 上传到 NAS 任意共享文件夹（例如 `/vol1/1000/个人/smartfan`）
-3. **SSH 登录 NAS（或 webSSH）** → 执行：
+| 排名 | 方式 | 难度 | 推荐度 | 适用场景 |
+|:---:|---|---|:---:|---|
+| 🥇 1 | **Docker Hub 拉取 + Shell 一键脚本** | ⭐ | ⭐⭐⭐⭐⭐ | 绝大多数用户，飞牛/群晖 NAS，零配置 1 分钟好 |
+| 🥈 2 | **Docker Hub 拉取 + Docker Compose** | ⭐⭐ | ⭐⭐⭐⭐ | 喜欢 Compose 管理多容器的用户 |
+| 🥉 3 | **本地构建镜像 (build-on-nas.sh)** | ⭐⭐⭐ | ⭐⭐⭐ | Docker Hub 访问受限 / 需要修改源码后自建镜像 |
+| 4 | **裸机脚本安装 (smartfan-install.sh)** | ⭐⭐⭐ | ⭐⭐ | 非 Docker 环境，物理机/虚拟机 Linux 部署 |
+| ❌ | **飞牛 NAS GUI 手动创建容器** | ⭐⭐ | ⭐ | **不推荐** — 有两大坑（健康检查误判 + 参数漏填），见文末排错 |
+
+---
+
+## 🥇 方式 1：Docker Hub 拉取（99% 用户首选）
+
+镜像地址：[`zxggh/fnsmartfan:latest`](https://hub.docker.com/r/zxggh/fnsmartfan)（自动支持 `linux/amd64` + `linux/arm64` 双架构，飞牛 x86/ARM NAS 通吃）
+
+### 方式 1-A：Shell 一键脚本（最稳，强烈推荐）
+SSH 登录飞牛 NAS → **切 root** → 执行**一条命令**（自动清旧容器 + 拉镜像 + 正确参数 + 状态轮询提示）：
+
+```bash
+su - root
+bash <(curl -s https://raw.githubusercontent.com/zxggh/fnsmartfan/main/deploy-on-fnnas.sh)
+```
+
+脚本会自动：
+1. 验证必须是 root 用户执行
+2. 删除同名旧容器
+3. 拉取 `zxggh/fnsmartfan:latest`
+4. 自动创建 `smartfan-data` 持久化卷
+5. 启动容器（100% 正确参数：`--user root --privileged -p 8780:8780 -v smartfan-data:/data -v /dev:/dev:rw -e TZ=Asia/Shanghai`）
+6. 2 分钟内每 5 秒轮询健康状态，**健康后打印中文成功提示 + 访问 URL**
+
+<details>
+<summary>如果飞牛 NAS 访问 GitHub raw 慢 → 手动执行脚本文件</summary>
+
+本地下载 `deploy-on-fnnas.sh` 上传到 NAS 后执行：
+```bash
+su - root
+chmod +x deploy-on-fnnas.sh
+./deploy-on-fnnas.sh
+```
+</details>
+
+---
+
+### 方式 1-B：Docker Compose（喜欢 Compose 的用户）
+
+把仓库根目录的 **`docker-compose-offline.yml`** 上传到 NAS 任意目录（例如 `/vol1/1000/docker/smartfan-fix/`），执行：
+
+```bash
+su - root
+cd /你的目录
+# 先拉最新镜像 + 后台启动
+docker compose -f docker-compose-offline.yml pull
+docker compose -f docker-compose-offline.yml up -d
+
+# 查看状态（等 30~90 秒健康检查）
+docker compose -f docker-compose-offline.yml ps
+```
+
+Compose 文件里已经包含**所有正确参数**：
+- `user: root` + `privileged: true`
+- 4 个常用串口 `--device` 兜底（ttyUSB0/1、ttyACM0/1）+ `/dev` 全映射
+- `smartfan-data` 卷自动创建（持久化配置 + 温度历史）
+- 健康检查 `start-period: 90s`（不会被 GUI 误判）
+- 日志 `10m × 5 文件` 限制（不撑爆 NAS 硬盘）
+
+---
+
+### 方式 1-C：一行版 docker run（高级用户，零续行零反斜杠）
+
+SSH 粘贴单条命令，直接跑：
+
+```bash
+su - root
+docker rm -f smartfan 2>/dev/null; docker run -d --name smartfan --user root --privileged --restart always -p 8780:8780 -v smartfan-data:/data -v /dev:/dev:rw -e TZ=Asia/Shanghai --log-driver json-file --log-opt max-size=10m --log-opt max-file=5 zxggh/fnsmartfan:latest
+```
+
+然后检查状态：
+```bash
+sleep 8; docker ps -a | grep smartfan
+```
+
+---
+
+### ❌ 不推荐：飞牛 NAS GUI 手动创建容器（两大坑必须绕过）
+
+如果你一定要在图形界面创建：
+
+| 必须设置项 | 值 | 为什么必须 |
+|---|---|---|
+| **用户** | **root** | NAS 串口访问 + `/data` 卷写入必须 |
+| **特权模式 / 最高权限** | ✅ 勾选 | 自动获得所有 `/dev/ttyUSB*` 设备权限 |
+| 端口映射 | 本地 `8780` → 容器 `8780` TCP | Web 控制台端口 |
+| 存储卷 1 | 命名卷 `smartfan-data` → 容器 `/data` | 配置文件 + 温度历史 JSONL 持久化 |
+| 存储卷 2 | 宿主机 `/dev` → 容器 `/dev`（读写） | 控制器 USB 串口访问 |
+| 环境变量 | `TZ=Asia/Shanghai` | 曲线 X 轴时间正确 |
+| 重启策略 | Always | NAS 重启后自动拉起 |
+
+⚠️ **飞牛 GUI 健康检查误判坑**：容器启动后 GUI 可能显示「启动失败，请查看运行日志」**千万不要删除容器**！首次启动需要 pip install 补装依赖约 30~60 秒，健康检查宽限期 90 秒，等 1~2 分钟**刷新容器列表页面**，99% 会自动变为「运行中（健康）」。
+
+---
+
+## 🥈 方式 2：NAS 本地构建镜像（Docker Hub 访问受限时用）
+
+适用于：NAS 在纯内网环境、Docker Hub 访问太慢/被屏蔽、自己修改了源码想直接打包。
+
+**步骤**：
+1. 上传仓库根目录的 `build-on-nas.sh` 和 `Dockerfile` + `smartfan-install.sh` 到 NAS 同一目录
+2. 执行：
    ```bash
-   # ① 切到 root (必须, 普通用户没 docker 权限)
    su - root
-   #    输入你的 root 密码, 提示符变成 root@xxx:~# 就对了
-
-   # ② 进入你放脚本的目录 (就是刚才上传 quick-start.sh 那个共享文件夹路径)
-   cd "/vol1/1000/个人/smartfan"     ← 改这里, 用你自己的真实路径
-
-   # ③ 一键执行 (自动完成: 检查环境 → 拉镜像 → 清旧容器 → 万能参数启动 → 健康验证)
-   bash quick-start.sh
+   chmod +x build-on-nas.sh
+   ./build-on-nas.sh
    ```
-4. **等 1~3 分钟**，脚本最后会输出 🎉 部署完成 + 浏览器访问地址 `http://NAS_IP:8780`，复制打开即可使用！
-
-<details><summary>💡 quick-start.sh 自动帮你做了什么?(三保险·比 GUI 更稳)</summary>
-
-| 步骤 | 自动处理什么 | 避免的坑 |
-|---|---|---|
-| 0 | 自动要求 root 执行 | 普通用户 ajima/其他人报 docker.sock permission denied |
-| 1 | 自动检查 docker 命令 + 8780 端口冲突 | 端口占用导致启动失败无提示 |
-| 2 | 自动拉 Docker Hub，超时自动 Fallback 尝试 GHCR，最后兜底本地镜像 | GUI 拉取超时直接卡死 |
-| 3 | 「⭐ 三保险·控制器识别」<br>**保险 A**: --privileged 特权模式<br>**保险 B**: 动态扫描宿主机真实存在的 ttyACM0~9/ttyUSB0~9，只映射真实存在的节点，不存在的完全跳过（不会因设备不存在启动失败！）<br>**保险 C**: `-v /dev:/dev-host-dev:ro` 宿主机整个 /dev 只读挂载进容器 → 兜底中的兜底！启动时没插控制器也行，之后任何时候插、任何 USB 口、任何 tty 编号、拔插随便切都能识别 | 控制器插到其他口变成 ttyACM2/ttyUSB3、启动时控制器没插导致 --device 映射失败 → 这些坑全部避免 |
-| 4 | 万能参数补齐（root用户/数据卷/时区/日志轮转/健康检查 30s 宽限期）| GUI 漏勾特权模式、漏挂 /dev-host-dev、健康检查太急误判「启动失败」|
-| 5 | 自动等 60 秒健康检查通过 + 验证 `/api/info` 响应 | 还没启动完就手忙脚乱点进去以为炸了 |
-| 6 | 最后输出部署指南 + 日常运维命令 + 升级方法 | 不用查文档了 |
-</details>
+3. 构建完用上面的「方式 1-C 一行版 docker run」启动（把镜像名从 `zxggh/fnsmartfan:latest` 改成你本地构建的 tag 即可）
 
 ---
 
-## ⏱️ 3 种部署方法 · 1-5 分钟搞定 (任选一种, 首推方法零)
+## 🥉 方式 3：裸机脚本安装 smartfan-install.sh（非 Docker）
 
-### ⭐⭐⭐ 方法一 · NAS 纯 GUI 点鼠标 (不用传脚本, 方法零脚本上传嫌麻烦用这个)
-**不用 SSH、不用传文件、全程点 NAS 浏览器管理页面。** 但我们强烈推荐**「懒人兜底填法」：设备映射列表可以完全留空！只要下面 3 个红色必填 + 2 个必挂卷做到位，三保险就能覆盖任何情况。**
-
-| 步骤 | 操作 (以飞牛 NAS 为例, 群晖/绿联/极空间流程完全类似) |
-|---|---|
-| 1 | 打开 NAS Web 管理 → **容器** → **镜像仓库** (Registry) 搜索框 → 搜 `zxggh/fnsmartfan` |
-| 2 | 找到 `zxggh/fnsmartfan` (Tag: `latest`, Size ~220MB) → 点右侧 **【拉取】** → 等 1-3 分钟拉完 |
-| 3 | 切到 **镜像** (Images) 列表 → 点 `zxggh/fnsmartfan:latest` 这一行右侧 **【创建容器】** |
-| 4 | **⭐ 懒人兜底填法（照着抄就行，漏一个红色必填直接炸）**： <ul><li>**名称**: `smartfan`</li><li>**端口映射**: 主机 `8780` → 容器 `8780` (TCP)</li><li>⚠️ **红色必填 1 · ✅ 勾特权模式 (Privileged)** <span style="color:red">(保险 A·USB 控制器 + HDD 温度必须，不勾必炸!)</span></li><li>⚠️ **红色必填 2 · 用户/UID**: `root` (或 UID=0) <span style="color:red">(避免 sg 密码提示导致容器无限重启)</span></li><li>**重启策略**: `always` (开机自启)</li><li>⚠️ **红色必填 3 · 2 个必挂卷 (漏一个 99% 功能异常!)** <br>① 新建卷名 `smartfan-data` → 容器路径 `/data` (默认「读写」, 配置持久化，删容器不丢)<br>② 宿主机路径 **`/dev`** → 容器路径 **`/dev-host-dev`** → **模式必须选 只读 (ro / Read-Only)** <span style="color:red">(保险 C·核心! HDD SMART 温度 + 任何 USB 口拔插兜底)</span></li><li>**环境变量**: `TZ` = `Asia/Shanghai` (日志/温控时区正确)</li><li>✅ **(可以完全不填!) 设备映射**: 想手动加就加 ttyACM0~9 / ttyUSB0~9；懒人直接**跳过留空就行**，上面「特权模式 + /dev→/dev-host-dev」已经兜底到任何 USB 口/任何编号了！</li></ul> |
-| 5 | 点 **【创建并启动】** → **等 1~2 分钟后再刷新容器列表**（健康检查 start_period=30s，加上首次启动 pip 补装依赖，飞牛 GUI **前 90 秒会误判「启动失败」**，千万别删容器！等 90 秒一刷新就自动变「运行中（健康）」）|
-| 6 | 浏览器打开 **http://你的NAS_IP:8780** → 完成 🎉 |
-
-<details><summary>💡 常见问题: GUI 报「启动失败，查看日志」？任何口都识别不到控制器？怎么办</summary>
-
-### ❓ GUI 先提示「启动失败」→ 90 秒后刷新变「运行中」
-**99% 是 GUI 健康检查误判**：首次启动要 `pip install -r requirements.txt` 补装依赖 + 健康检查 `start_period=30s`，**前 60 秒容器健康状态是 starting，飞牛 GUI 会把 starting/健康检查中 误判成「启动失败」**，实际上容器正常在启动。
-✅ 解决：**别删容器！别点停止！等 90 秒刷新容器列表页面，90% 就会自动变成「运行中（健康）」**
-
-### ❓ 真的启动失败（容器直接退出，或者等了 2 分钟状态还是 Exited）
-回到上面步骤 4 检查「懒人兜底填法」红色必填 3 项有没有做到位：
-- 【特权模式】有没有打勾？
-- 用户是不是填了 root（UID=0）？
-- 2 个必挂卷是不是都挂了？特别是宿主机 `/dev` → 容器 `/dev-host-dev`，模式是**只读**！
-如果上面 3 项有一项漏了，删容器按懒人兜底填法重来一次；或者直接换**方法零 quick-start.sh 一键脚本**（100% 参数齐全，零漏项）。
-
-### ❓ 容器显示 running，但任何 USB 口插控制器 Web UI 里都显示「未连接」
-99% 是**没勾【特权模式】或者漏挂 `/dev` → `/dev-host-dev` 只读卷**，导致容器里看不到宿主机 USB 设备节点。
-✅ 快速自检（root 下跑）：
-```bash
-# 只要 /dev-host-dev 下面有 ttyACM*/ttyUSB*，就证明容器参数是对的
-docker exec smartfan ls -l /dev-host-dev/ttyACM* /dev-host-dev/ttyUSB* 2>&1
-```
-如果上面命令输出还是「No such file or directory」，那就 100% 是卷没挂对 → 删容器按懒人兜底填法重来一次。
-</details>
-
----
-
-### ⭐⭐ 方法二 · Compose 文件一键部署 (推荐, 适合所有 NAS)
-适合想一键启停/备份配置、或者 NAS 有 Compose/Stack 菜单的用户。**本方法已内置「三保险」：devices 列表扩展到 ttyACM0~9 + ttyUSB0~9（Compose 自动跳过不存在的节点，不会报错！）+ 特权模式 + /dev-host-dev 兜底。**
-
-1. 下载仓库根目录的 **[docker-compose.remote.yml](./docker-compose.remote.yml)** 到本地电脑
-2. 打开 NAS Web 管理 → **容器** → **Compose / Stack** → **【+ 创建项目】**
-3. 填写:
-   - 项目名称: `smartfan`
-   - 路径: 随便选一个你可读写的共享文件夹 (例如 `/vol1/1000/个人/smart fan`)
-   - 上传模式: 上传刚才下载的 `docker-compose.remote.yml`
-4. 点 **【确定】** → NAS 会自动 `docker pull zxggh/fnsmartfan:latest` → 创建卷 → 启动容器
-5. 浏览器打开 **http://NAS_IP:8780** → 完成 🎉
-
-<details><summary>💡 想命令行跑? 直接复制下面这个「三保险完整版」docker-compose.yml 也行（0~9 全覆盖）</summary>
-
-```yaml
-services:
-  smartfan:
-    container_name: smartfan
-    image: zxggh/fnsmartfan:latest
-    restart: always
-    ports:
-      - "8780:8780"
-    # 保险 A: 特权模式 (给容器完整权限访问宿主机 /dev)
-    privileged: true
-    # 保险 B: ttyACM0~9 + ttyUSB0~9 全覆盖
-    #         Docker Compose 自动跳过不存在的节点, 不会报错!
-    devices:
-      - "/dev/ttyACM0:/dev/ttyACM0"
-      - "/dev/ttyACM1:/dev/ttyACM1"
-      - "/dev/ttyACM2:/dev/ttyACM2"
-      - "/dev/ttyACM3:/dev/ttyACM3"
-      - "/dev/ttyACM4:/dev/ttyACM4"
-      - "/dev/ttyACM5:/dev/ttyACM5"
-      - "/dev/ttyACM6:/dev/ttyACM6"
-      - "/dev/ttyACM7:/dev/ttyACM7"
-      - "/dev/ttyACM8:/dev/ttyACM8"
-      - "/dev/ttyACM9:/dev/ttyACM9"
-      - "/dev/ttyUSB0:/dev/ttyUSB0"
-      - "/dev/ttyUSB1:/dev/ttyUSB1"
-      - "/dev/ttyUSB2:/dev/ttyUSB2"
-      - "/dev/ttyUSB3:/dev/ttyUSB3"
-      - "/dev/ttyUSB4:/dev/ttyUSB4"
-      - "/dev/ttyUSB5:/dev/ttyUSB5"
-      - "/dev/ttyUSB6:/dev/ttyUSB6"
-      - "/dev/ttyUSB7:/dev/ttyUSB7"
-      - "/dev/ttyUSB8:/dev/ttyUSB8"
-      - "/dev/ttyUSB9:/dev/ttyUSB9"
-    volumes:
-      - smartfan-data:/data
-      # 保险 C · 必挂核心: 宿主机 /dev 整卷只读挂载进容器 (兜底中的兜底)
-      - /dev:/dev-host-dev:ro
-    user: root
-    environment:
-      - TZ=Asia/Shanghai
-    healthcheck:
-      test: ["CMD", "curl", "-s", "-m", "3", "http://127.0.0.1:8780/api/info"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
-volumes:
-  smartfan-data:
-    driver: local
-```
-保存成 `docker-compose.yml`，目录里执行 `docker compose up -d` 就行。
-</details>
-
----
-
-### ⭐⭐⭐ 方法三 · 离线部署 (NAS 完全没外网 / Docker Hub 拉不下来)
-在一台**能联网的 Windows / macOS / Linux 电脑**上把镜像导出成 tar，拷到 NAS 导入：
+适用于：物理机 Linux / LXC 容器 / 不想用 Docker 的虚拟机。
 
 ```bash
-# ========== 能联网的电脑上执行 ==========
-# 1. 拉镜像
-docker pull zxggh/fnsmartfan:latest
-
-# 2. 导出成 tar (约 220MB)
-docker save zxggh/fnsmartfan:latest -o fnsmartfan-latest.tar
-
-# ========== 拷 fnsmartfan-latest.tar 到 NAS ==========
-# 在 NAS Web 管理 → 容器 → 镜像 → 【导入镜像】 → 选这个 tar 导入
-# 导入成功后镜像会显示: zxggh/fnsmartfan:latest
-
-# ========== 之后就按方法一 GUI 创建容器, 或方法二 compose up 即可 ==========
+su - root
+wget https://raw.githubusercontent.com/zxggh/fnsmartfan/main/smartfan-install.sh -O /tmp/install.sh
+chmod +x /tmp/install.sh
+bash /tmp/install.sh
 ```
 
----
+脚本会自动：
+- 把所有程序文件释放到 `/opt/fan-controller/`
+- 创建 Python venv + 安装依赖
+- 注册 systemd 服务 `fan-controller.service` + 开机自启
+- 安装 smartmontools（HDD 温度采集）
 
-## ✅ 部署后验证清单 (浏览器打开 Web UI 后检查 4 件事)
-| 检查项 | 预期结果 | 不通过时检查 |
-|---|---|---|
-| ① 系统状态卡片 | 显示 **CPU/HDD 温度有数值** (不是 N/A / `--`) | 首次启动等 15 秒自动采集; 确认勾选了**特权模式**、挂了 `/dev` → `/dev-host-dev` **只读** |
-| ② 控制器连接状态 | 显示 **已连接 (绿色)** | 确认 USB CDC 控制器插入; 检查端口是否 `/dev/ttyACM0` |
-| ③ 「🖥️ 原始命令」卡顶 | 有绿色 **『⏸ 已启用』** 按钮 (v2.2 新增开关，点一下可切红色『▶ 已停用』停止自动下发) | 没这按钮说明拉到了旧镜像，重拉 `docker pull zxggh/fnsmartfan:latest` |
-| ④ 手动发命令测试 | 在原始命令输入框输 **`F1CPD=30`** 回车 → 风扇1 进度条立刻变 30%; 再输 **`F1CPD=0`** 立刻 0% | 进度条未立即更新不影响核心功能 (温控自动下发始终正常)，后续版本会修复 |
+访问：`http://服务器IP:8780`
 
 ---
 
-## 🛠️ 日常运维命令 (懂 SSH 的话, 不懂就用 GUI 重启就行)
+## ✅ 验证部署成功（三条命令）
+
 ```bash
-# 重启容器
+# 1. 容器状态：看到 Up (healthy) 就成功
+docker ps -a --filter name=smartfan
+
+# 2. 启动日志环境自检：3 项 OK（UID=0 / 有串口 / /data 可写）
+docker logs smartfan 2>&1 | grep -E "环境自检|UID|串口|写入权限|deps ok|Uvicorn running"
+
+# 3. 页面返回 JSON（不打命令直接浏览器打开也 OK）
+curl -s http://127.0.0.1:8780/api/info | python3 -m json.tool
+```
+
+打开浏览器 → **http://你的NAS-IP:8780** → 看到温控仪表盘就全部 OK。
+
+---
+
+## ⚠️ 飞牛 NAS 常见坑 & 排错清单（v6 已内置防护，但仍可能遇到）
+
+| # | 坑 | 现象 | 解决方法 |
+|---|---|---|---|
+| 1 | **GUI 健康检查误判「启动失败」** | 创建后 GUI 弹窗失败，但容器仍在运行中 | ❌ 不要删容器！等 1~2 分钟刷新「容器列表」，自动变为运行中（健康）。v6 已把 start-period 从 10s 拉到 90s，大幅降低误判率。 |
+| 2 | **参数漏填导致启动失败/无限重启** | 容器启动后 1 秒退出 / 重启循环 | 改用 🥇 Shell 一键脚本，所有参数全自动配齐，不会漏填。v6 镜像启动时还会打印环境自检 WARNING：非 root / 无串口 / 卷无写权限。 |
+| 3 | **PermissionError: /data/temp_history.jsonl** | 容器日志里报权限不足，服务起不来 | 两种办法：① 执行 `chmod -R 777 /vol1/docker/volumes/smartfan-data/_data`；② 确保启动时加 `--user root`（一键脚本已包含）。v6 代码层即使失败也自动降级内存模式，不崩服务。 |
+| 4 | **端口 8780 被占用** | `docker run` 报 "port is already allocated" | 查占用：`netstat -tlnp \| grep 8780`，停掉占用程序，或把本地端口改成别的（例如 `-p 8781:8780`）。 |
+| 5 | **控制器串口未识别** | 日志里「检测到的串口设备数：0」 | ① 确认 USB 线插好了，重新插拔控制器；② 确保 `--privileged` 已开启 + `-v /dev:/dev:rw`（一键脚本已包含）；③ NAS 执行 `ls /dev/ttyUSB* /dev/ttyACM*` 看设备文件是否存在。 |
+| 6 | **Docker Hub 拉取太慢 / 超时** | `docker pull` 长时间卡住 | 飞牛「容器管理 → 设置 → 镜像加速」打开国内加速器（阿里云、网易等）；或用 🥈 本地构建方式。 |
+| 7 | **容器删不掉 (No such container / name conflict)** | `docker rm` 失败 / 名字冲突 | 执行：`docker rm -f $(docker ps -aq --filter name=smartfan) 2>/dev/null; docker container prune -f`；仍不行就 `systemctl restart docker` 清僵尸。 |
+
+---
+
+## 🔧 日常维护命令
+
+```bash
+# 查看最新 50 行日志
+docker logs --tail 50 smartfan
+
+# 实时跟随日志（排障用）
+docker logs -f smartfan
+
+# 重启服务（改完配置后）
 docker restart smartfan
 
-# 看最近 50 行日志 (排查控制器断连/温控)
-docker logs --tail 50 -f smartfan
+# 停 + 删容器（保留数据卷 smartfan-data）
+docker rm -f smartfan
 
-# 升级到最新镜像 (永久保留配置卷 smartfan-data, 不会丢)
+# 升级到最新镜像（保留数据）
 docker pull zxggh/fnsmartfan:latest
 docker rm -f smartfan
-# 然后按"方法一"重新创建容器即可 (compose 用户直接 docker compose up -d)
+# 然后用「方式 1-A / 1-C」重新启动（数据卷 smartfan-data 会保留配置和温度历史）
 
-# 备份配置 (config.yaml) 到本地
-docker cp smartfan:/app/config.yaml ./smartfan-config-backup.yaml
-
-# 完全卸载 (⚠️ 最后那条会删除配置! 慎用)
-docker rm -f smartfan
-docker rmi zxggh/fnsmartfan:latest
-docker volume rm smartfan-data   # ⚠️ 这行才是真的删 config.yaml
+# 备份温度历史和配置（复制到 ~/smartfan-backup-日期.tar.gz）
+docker run --rm -v smartfan-data:/data -v ~:/backup alpine tar czf /backup/smartfan-backup-$(date +%Y%m%d).tar.gz -C /data .
 ```
 
 ---
 
-## 🆗 已预装依赖 (容器镜像已自带, 不需要你再 apt install / pip install)
-- ✅ `smartmontools` → HDD/SSD SMART 温度检测
-- ✅ `python3-pip` → Python 运行环境 (pyyaml / fastapi / uvicorn 等按需自动补装)
-- ✅ `curl` / `tzdata` / `ca-certificates` → Web 健康检查 + 时区 + HTTPS CA
+## 📂 数据目录结构（smartfan-data 卷）
+
+容器内 `/data` 对应卷 `smartfan-data`，NAS 宿主机路径：
+```
+/vol1/docker/volumes/smartfan-data/_data/
+├── config.yaml              # 温控阈值 / 串口 / 日志 配置
+├── temp_history.jsonl       # 温度历史持久化 (JSON Lines, 7 天自动保留)
+├── auto_cmd_state.json      # 自动命令开关持久化状态
+└── disconnect_log.jsonl     # 控制器断连日志（排障用）
+```
+
+**升级 / 重建容器完全不影响这些文件**，所有配置和温度历史都会保留。
