@@ -314,6 +314,14 @@ function updateFans(data) {
 function initChart() {
   const ctx = document.getElementById("temp-chart");
   if (!ctx) return;
+
+  // ★ v6 图例布局自适应:
+  //   手机端 (<=680px) 缩小方框+字体+间距, 4 个图例一行放下, 避免环境温度自动折第二行
+  const isMobile = window.innerWidth <= 680;
+  const LEG_BOX = isMobile ? 11 : 14;          // 方框宽度(手机更小)
+  const LEG_PAD = isMobile ? 6  : 10;          // 图例间距
+  const LEG_FNT = isMobile ? 10 : 12;          // 字号
+
   chart = new Chart(ctx, {
     type: "line",
     data: {
@@ -370,31 +378,30 @@ function initChart() {
         legend: {
           position: "top",
           align: "start",
-          // ★ v6 修复: 手机端常见误触 (点一下颜色框曲线就消失)
-          //   onClick=null 完全禁用点击切换, 只用来作为颜色含义展示
+          // 防手机误触 (点一下颜色框曲线就消失)
           onClick: null,
           labels: {
-            color: "#888a9e",
-            font: { size: 11 },
-            usePointStyle: true,     // 用圆点+方框: 更紧凑, 一行塞得下 4 个
-            pointStyle: "rectRounded",
-            boxWidth: 10,
-            boxHeight: 10,
-            padding: 8,              // 相邻图例间距稍微压缩, 手机端不挤
-            // ★ v6 二次修复: 自定义 generateLabels 彻底消除「删除线」效果
-            //   即使内部 dataset.hidden=true (如果有残留), 生成的图例项 strokeStyle=false (不加删除线)
+            // ★ v6 自适应方框+字号+间距 (LEG_* 上面按屏幕宽度算的):
+            //   PC 端: box14 / pad10 / font12 (默认舒适大小)
+            //   手机端: box11 / pad6  / font10 (紧凑, 4 个一行放下, 环境温度不会折行)
+            boxWidth: LEG_BOX,
+            boxHeight: Math.round(LEG_BOX * 0.75),
+            padding: LEG_PAD,
+            font: { size: LEG_FNT },
+            // ★ v6 generateLabels (这次写齐所有字段, 再也不出现黑字/黑边框!)
             generateLabels: (chart) => {
               return chart.data.datasets.map((ds, i) => ({
                 text: ds.label,
-                // ★ v6 三次修复: 方框颜色必须用 borderColor (曲线本身的实色:红/绿/橙/蓝)
-                //   之前误取 backgroundColor (rgba(*,*,*,0.08) 淡填充色) → 方框几乎透明看不清!
-                fillStyle: ds.borderColor,
-                strokeStyle: null,       // 关键: 不加删除线
-                hidden: false,           // 关键: 强制图例永远显示为「未隐藏」状态
-                lineWidth: 2,
+                // ★ 方框内部填充白色 (用户明确要求)
+                fillStyle: "#ffffff",
+                // ★ 方框边框颜色 = 曲线本身的实色 (红/绿/橙/蓝)
+                strokeStyle: ds.borderColor,
+                lineWidth: 2,               // 边框粗 2px, 醒目
+                // ★ 文字颜色必须显式设置 (自定义 generateLabels 后外层 color 会失效, 不写=黑色!)
+                fontColor: "#c9ccd8",
+                // ★ 防删除线 + 禁用图例点击隐藏曲线
+                hidden: false,
                 index: i,
-                pointStyle: ds.pointStyle || "rectRounded",
-                borderColor: ds.borderColor,
               }));
             },
           },
