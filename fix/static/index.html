@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智能风扇控制器</title>
+<link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+<header>
+  <div class="header-left">
+    <h1>🌬️ 智能风扇控制器</h1>
+    <span class="subtitle">NAS 线性温控系统</span>
+  </div>
+  <div class="header-right">
+    <span class="badge" id="conn-badge">⚪ 未连接</span>
+    <span class="uptime" id="uptime">运行: --</span>
+  </div>
+</header>
+
+<main>
+  <!-- 左栏: 仪表盘 -->
+  <section class="dashboard">
+    <div class="card temp-card">
+      <div class="card-header">🌡️ 系统温度</div>
+      <div class="card-body">
+        <div class="temp-grid">
+          <div class="temp-item"><label>CPU</label><span id="cpu-temp" class="temp-val">--</span></div>
+          <div class="temp-item"><label>SSD</label><span id="ssd-temp" class="temp-val">--</span></div>
+          <div class="temp-item"><label>HDD</label><span id="hdd-temp" class="temp-val">--</span></div>
+          <div class="temp-item"><label>🌡️ 环境温度</label><span id="ntc-temp" class="temp-val">--</span></div>
+        </div>
+        <div class="chart-container">
+          <canvas id="temp-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div class="card fan-card">
+      <div class="card-header">🌀 风扇状态</div>
+      <div class="card-body">
+        <div class="fan-grid">
+          <div class="fan-item" id="fan1">
+            <h3>FAN</h3>
+            <div class="fan-gauge">
+              <div class="gauge-bar"><div class="gauge-fill" id="fan1-bar" style="width:0%"></div></div>
+            </div>
+            <div class="fan-info">
+              <span>转速: <strong id="fan1-speed">--</strong></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card disc-card" id="disc-card">
+      <div class="card-header">
+        <span>🔌 断连记录</span>
+        <span id="disc-status" class="disc-status">--</span>
+        <span id="disc-arrow" class="disc-arrow">▼</span>
+        <button class="btn btn-sm" onclick="event.stopPropagation();toggleDiscCard()" style="margin-left:auto">折叠</button>
+      </div>
+      <div class="card-body disc-body-wrap" id="disc-body">
+        <div class="disc-empty">暂无断连记录</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右栏: 控制面板 -->
+  <section class="control-panel">
+    <div class="card">
+      <div class="card-header">
+        <span>⚙️ 温控配置</span>
+        <span style="font-size:11px;color:var(--text-muted)">取最高温→线性映射→设风扇</span>
+        <button class="btn btn-sm btn-primary" onclick="runControl()">▶ 执行</button>
+        <button class="btn btn-sm" onclick="resetControl()">↺ 默认</button>
+      </div>
+      <div class="card-body">
+        <div class="ctrl-row">
+          <label>🌡️</label>
+          <span>启动 <input type="number" id="ctrl-start" value="35" min="0" max="100"> °C</span>
+          <span>最高 <input type="number" id="ctrl-max" value="60" min="0" max="100"> °C</span>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:8px;text-align:center">
+          最高温 → <strong id="ctrl-preview" style="color:var(--warning)">--</strong>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">💡 LED 控制</div>
+      <div class="card-body">
+        <button class="btn btn-led" id="led-btn" onclick="toggleLed()">💡 LED 关</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span>🖥️ 原始命令</span>
+        <div class="auto-cmd-switch">
+          <span class="auto-cmd-label">自动命令</span>
+          <button class="btn btn-auto-cmd" id="auto-cmd-btn" onclick="toggleAutoCmd()">⏸ 已启用</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="raw-input">
+          <input type="text" id="raw-cmd" placeholder="如: GETNTC? / F1CPD? / F1CPD=80 / ALL"
+                 onkeydown="if(event.key==='Enter')sendRaw()">
+          <button class="btn btn-primary" onclick="sendRaw()">发送</button>
+        </div>
+        <div class="auto-cmd-hint" id="auto-cmd-hint">
+          ✅ 自动命令已开启：正常按时间下发心跳/温控（手动发送仍可用）
+        </div>
+        <pre id="raw-response" class="raw-response">等待命令...</pre>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span>🔍 调试日志</span>
+        <button class="btn btn-sm" onclick="refreshLog()">⟳ 刷新</button>
+      </div>
+      <div class="card-body">
+        <pre id="debug-log" class="raw-response" style="max-height:300px;font-size:11px;color:var(--text)">加载中...</pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="/static/app.js?v=3"></script>
+</body>
+</html>

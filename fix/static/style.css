@@ -1,0 +1,198 @@
+/* STC 智能风扇控制器 — UI 精简版样式 */
+:root {
+  --bg: #0f1117;
+  --card: #1a1d2e;
+  --card-hover: #222642;
+  --border: #2a2e45;
+  --text: #e0e2f0;
+  --text-muted: #888a9e;
+  --primary: #4f8cff;
+  --primary-hover: #3a70dd;
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #ef4444;
+  --hot: #ff6b6b;
+  --cold: #6bcbff;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 16px 24px; background: var(--card); border-bottom: 1px solid var(--border);
+}
+.header-left h1 { font-size: 20px; font-weight: 600; }
+.subtitle { font-size: 12px; color: var(--text-muted); margin-left: 8px; }
+.header-right { display: flex; align-items: center; gap: 16px; }
+.badge { font-size: 12px; padding: 4px 12px; border-radius: 12px; background: var(--border); color: var(--text-muted); }
+.badge.online { background: #1a3a2a; color: var(--success); }
+.uptime { font-size: 12px; color: var(--text-muted); }
+
+main {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  padding: 16px; max-width: 1600px; margin: 0 auto;
+}
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin-bottom: 16px; }
+.card-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 16px; font-size: 14px; font-weight: 600;
+  border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02);
+}
+.card-body { padding: 16px; }
+
+/* 温度网格(4列: CPU/SSD/HDD/NTC) */
+.temp-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px;
+}
+.temp-item { text-align: center; padding: 12px 8px; background: rgba(255,255,255,0.03); border-radius: 8px; }
+.temp-item label { font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px; }
+.temp-val { font-size: 22px; font-weight: 700; }
+.temp-val.hot { color: var(--hot); }
+.temp-val.cold { color: var(--cold); }
+.temp-val.na { color: var(--text-muted); font-size: 14px; }
+
+/* 图表 (v2: 高度增加到220, 容纳X轴时间戳标签) */
+.chart-container { height: 220px; position: relative; }
+
+/* 风扇(单风扇) */
+.fan-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+.fan-item { padding: 16px; background: rgba(255,255,255,0.03); border-radius: 8px; }
+.fan-item h3 { font-size: 14px; margin-bottom: 12px; color: var(--primary); }
+.gauge-bar { height: 20px; background: var(--border); border-radius: 10px; overflow: hidden; }
+.gauge-fill { height: 100%; background: linear-gradient(90deg, var(--success), var(--warning), var(--danger)); border-radius: 10px; transition: width 0.5s ease; }
+.fan-info { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); }
+.fan-info strong { color: var(--text); }
+
+/* 温控配置 */
+.ctrl-row {
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  padding: 10px; border-radius: 6px; background: rgba(255,255,255,0.02);
+}
+.ctrl-row input[type="number"] {
+  width: 55px; padding: 4px 6px; font-size: 13px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--text); text-align: center;
+}
+.ctrl-row input:focus { outline: none; border-color: var(--primary); }
+
+/* 按钮 */
+.btn {
+  padding: 6px 14px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--card); color: var(--text); transition: all 0.2s;
+}
+.btn:hover { background: var(--card-hover); }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+.btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-led { background: #fbbf24; border-color: #fbbf24; color: #000; padding: 8px 24px; font-size: 14px; }
+.btn-led:hover { background: #f59e0b; }
+.btn-led.on { background: #34d399; border-color: #34d399; color: #fff; }
+.btn-led.on:hover { background: #10b981; }
+
+/* 执行按钮"点完立即闪烁" — 配合前端乐观更新, 让用户知道命令已经下发
+   500ms后自动移除(见app.js runControl里的setTimeout) */
+.btn.exec-flash {
+  background: var(--success) !important;
+  border-color: var(--success) !important;
+  color: #fff !important;
+  box-shadow: 0 0 0 3px rgba(52,211,153,0.25);
+  transform: scale(1.03);
+}
+
+/* 原始命令卡片: 自动命令开关布局 */
+.auto-cmd-switch {
+  display: flex; align-items: center; gap: 8px;
+  margin-left: auto;
+}
+.auto-cmd-label {
+  font-size: 11px; color: var(--text-muted);
+  font-weight: normal;
+}
+.btn-auto-cmd {
+  padding: 4px 12px; font-size: 12px; font-weight: 600;
+  border-radius: 16px; transition: all 0.2s;
+}
+.btn-auto-cmd.on {
+  background: #1a3a2a; border-color: var(--success); color: var(--success);
+}
+.btn-auto-cmd.on:hover { background: #225540; }
+.btn-auto-cmd.off {
+  background: #3a1a1a; border-color: var(--danger); color: var(--danger);
+}
+.btn-auto-cmd.off:hover { background: #552222; }
+.auto-cmd-hint {
+  font-size: 12px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 6px;
+  text-align: center;
+  line-height: 1.5;
+}
+.auto-cmd-hint.on {
+  background: rgba(52, 211, 153, 0.08);
+  border: 1px solid rgba(52, 211, 153, 0.2);
+  color: var(--success);
+}
+.auto-cmd-hint.off {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  color: var(--danger);
+}
+
+/* 原始命令 */
+.raw-input { display: flex; gap: 8px; margin-bottom: 12px; }
+.raw-input input {
+  flex: 1; padding: 8px 12px; font-size: 13px; font-family: "Cascadia Code","Fira Code",monospace;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text);
+}
+.raw-input input:focus { outline: none; border-color: var(--primary); }
+.raw-response {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px; font-family: "Cascadia Code","Fira Code",monospace;
+  font-size: 12px; min-height: 80px; max-height: 200px; overflow: auto;
+  white-space: pre-wrap; word-break: break-all; color: var(--success);
+}
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  .temp-grid { grid-template-columns: repeat(2, 1fr); }
+  .fan-grid { grid-template-columns: 1fr; }
+}
+
+/* 断连记录卡片(左栏, 可折叠) */
+.disc-status { font-size: 11px; padding: 2px 8px; border-radius: 8px; background: var(--border); color: var(--text-muted); }
+.disc-status.on { background: #1a3a2a; color: var(--success); }
+.disc-status.off { background: #3a1a1a; color: var(--danger); }
+.disc-arrow { font-size: 10px; color: var(--text-muted); transition: transform 0.2s; }
+.disc-card.collapsed .disc-arrow { transform: rotate(-90deg); }
+.disc-card.collapsed .disc-body-wrap { display: none; }
+.disc-body-wrap {
+  padding: 6px 16px 12px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  max-height: 300px;
+  font-size: 11px;
+  -webkit-overflow-scrolling: touch;
+}
+.disc-entry {
+  display: flex;
+  flex-direction: column;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.disc-entry .disc-time { color: var(--text); }
+.disc-entry .disc-dur { color: var(--text-muted); font-size: 10px; }
+.disc-entry.recovered .disc-time { color: var(--success); }
+.disc-entry.disconnected .disc-time { color: var(--danger); }
+.disc-empty { text-align: center; color: var(--text-muted); padding: 12px; font-size: 11px; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
