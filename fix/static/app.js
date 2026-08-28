@@ -386,7 +386,9 @@ function initChart() {
             generateLabels: (chart) => {
               return chart.data.datasets.map((ds, i) => ({
                 text: ds.label,
-                fillStyle: ds.backgroundColor?.match?.(/rgba?\([^)]+\)/)?.[0] || ds.borderColor,
+                // ★ v6 三次修复: 方框颜色必须用 borderColor (曲线本身的实色:红/绿/橙/蓝)
+                //   之前误取 backgroundColor (rgba(*,*,*,0.08) 淡填充色) → 方框几乎透明看不清!
+                fillStyle: ds.borderColor,
                 strokeStyle: null,       // 关键: 不加删除线
                 hidden: false,           // 关键: 强制图例永远显示为「未隐藏」状态
                 lineWidth: 2,
