@@ -13,6 +13,8 @@ STC 智能风扇控制器 — FastAPI REST API
   POST  /api/control/run    — 执行一次温控(读温度→算转速→设转速)
   POST  /api/raw            — 发送原始命令
   GET   /api/info           — 服务/连接信息
+  GET   /api/temps/history?range=1h|6h|24h|3d|7d  — [v6 新增] 温度历史曲线数据
+                                              (1分钟采样, 7天保留, JSONL存/data)
 
 v4 修复:
   - heartbeat 心跳节奏从 5.1s 降到 3.5s(sleep 1.5s + ping 2s), 远离 STC 5s 复位窗口
@@ -36,6 +38,8 @@ from serial_ctrl import STCController
 from temp_collector import TempCollector
 from control import FanController, DEFAULT_CONFIG
 from disconnect_log import DisconnectLogger
+# v6 新增: 温度历史持久化 (JSONL 写入 /data 卷, 7 天保留, 降采样查询)
+from temp_history import TempHistory, parse_range, RANGE_MAP, fmt_timestamp
 
 # ── 配置 ──
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -67,6 +71,8 @@ controller: Optional[STCController] = None
 temp_collector: Optional[TempCollector] = None
 fan_control: Optional[FanController] = None
 disc_log: Optional[DisconnectLogger] = None
+# v6 新增: 温度历史持久化实例 (后台 60s 采样, 7 天 JSONL 存 /data)
+temp_history: Optional[TempHistory] = None
 start_time = time.time()
 
 # ── 自动命令发送使能开关(调试用) ──
@@ -97,9 +103,11 @@ def _save_auto_cmd_state(enabled: bool):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global controller, temp_collector, fan_control, disc_log, auto_cmd_enabled
+    global controller, temp_collector, fan_control, disc_log, auto_cmd_enabled, temp_history
     # 启动时加载持久化的开关状态
     auto_cmd_enabled = _load_auto_cmd_state()
+    # v6 初始化温度历史持久化 (放在 /data 卷, 容器重启不丢, 启动时清理过期数据)
+    temp_history = TempHistory()
     logger.info(f"自动命令发送开关: {'开启' if auto_cmd_enabled else '关闭'}")
     controller = STCController(**config["serial"])
     temp_collector = TempCollector()
@@ -221,9 +229,67 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(10)
     task_ac = asyncio.create_task(auto_control())
 
+    # v6 新增: 温度历史采集任务 (每 60 秒采样 1 次, 写 JSONL 到 /data, 7 天保留)
+    # 注意: 这个任务不依赖 auto_cmd_enabled 开关, 即使关闭自动命令也继续记录温度
+    #       (历史数据是用来分析的, 和控温逻辑解耦)
+    async def history_collector():
+        last_run = 0  # 避免启动时多线程抢跑
+        while True:
+            try:
+                await asyncio.sleep(10)  # 启动先等 10s, 让其它任务先跑起来 + 连接建立
+                now = time.time()
+                # 每 SAMPLE_INTERVAL_S (默认60s) 采样一次
+                if now - last_run < 60:
+                    continue
+                last_run = now
+                if not (temp_history and temp_collector):
+                    continue
+                # 采集 NAS 温度 (CPU/SSD/HDD)
+                td = await temp_collector.collect_all()
+                cpu = None
+                for k, v in td.items():
+                    if "coretemp" in k and isinstance(v, dict):
+                        vals = [x for x in v.values() if isinstance(x, (int, float))]
+                        if vals:
+                            cpu = round(max(vals), 1)
+                ssd = td.get("hwmon_nvme", {}).get("temp1_input")
+                hdd = td.get("hdd", {}).get("temperature")
+                if hdd is None:
+                    hdd = td.get("disk_sda", {}).get("temperature")
+                # NTC 从缓存读 (不占串口, ping 每 3.5s 就在刷新缓存)
+                ntc = None
+                if controller:
+                    res = controller.get_ntc_cached()
+                    if res.get("ok"):
+                        ntc_val = res.get("temperature")
+                        if isinstance(ntc_val, (int, float)):
+                            ntc = round(float(ntc_val), 1)
+                # 写入历史 (4 个温度都可能为 None, 代表当时没采集到)
+                temp_history.add_record(cpu=cpu, ssd=ssd, hdd=hdd, ntc=ntc)
+            except Exception as e:
+                # 兜底: 任何异常都不会让历史采集崩溃
+                logger.error(f"history_collector 异常(已吞掉, 30秒后继续): {e}", exc_info=True)
+                await asyncio.sleep(30)
+
+    task_hist = asyncio.create_task(history_collector())
+
+    # v4: task 意外结束时自动重建 (同样模式套给 history_collector)
+    def _hist_done_callback(t):
+        if t.cancelled():
+            return
+        exc = t.exception() if not t.cancelled() else None
+        if exc:
+            logger.error(f"history task 意外结束: {exc}, 5秒后重建")
+        else:
+            logger.warning("history task 意外退出(无异常), 5秒后重建")
+        new_task = asyncio.create_task(history_collector())
+        new_task.add_done_callback(_hist_done_callback)
+    task_hist.add_done_callback(_hist_done_callback)
+
     yield
     task_hb.cancel()
     task_ac.cancel()
+    task_hist.cancel()
     if controller and controller._writer:
         await controller.disconnect()
 
@@ -297,6 +363,73 @@ async def get_temps():
         }}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+@app.get("/api/temps/history")
+async def get_temps_history(range: str = "24h"):
+    """v6 新增: 查询温度历史曲线数据.
+
+    Query 参数 range 可选: 1h / 6h / 12h / 24h / 3d / 7d
+    设计说明:
+      - 后端以 1 分钟/条 的频率写入 JSONL 到 /data (容器卷, 重启不丢)
+      - 7 天自动保留 ≈ 1 万条, 单条 70B, 对 NAS 完全零压力
+      - 查询时返回点数 > MAX_POINTS(默认360) 时自动按时间桶做均值降采样,
+        保证前端 ECharts 画图不卡顿
+      - 本接口和 /api/temps(实时采集, 每 3s 轮询 poll 用) 解耦:
+        实时卡片用 poll, 历史曲线用本接口整图重绘
+    返回:
+      - ok / range / seconds        : 回显请求参数, 方便前端校验
+      - total_history_records        : 磁盘上总共累积了多少条(1条=1分钟)
+      - returned_points / max_points_cap : 本次返回条数 / 降采样上限
+      - ranges: 可用选项列表 (给前端下拉菜单直接用, 带中文标签)
+      - points: 数据点数组, 每点含 label/X轴文字 + 4 个温度(None=未采集到)
+    """
+    if not temp_history:
+        return {"ok": False, "error": "未初始化"}
+    seconds = parse_range(range)
+    records = temp_history.query_range_seconds(seconds)
+    # 组装返回, label 字段前端直接当 X 轴文字 (已格式化)
+    points = []
+    for r in records:
+        ts = r["t"]
+        points.append({
+            "t": ts,
+            "label": fmt_timestamp(ts, seconds),
+            "cpu": r.get("cpu"),
+            "ssd": r.get("ssd"),
+            "hdd": r.get("hdd"),
+            "ntc": r.get("ntc"),
+        })
+    # 统计总记录数 (给用户看历史总积累, 增加信任感)
+    total_raw = len(records)
+    try:
+        from pathlib import Path as _P
+        fp = _P("/data/temp_history.jsonl")
+        if fp.exists():
+            with open(fp, "r", encoding="utf-8") as f:
+                total_raw = sum(1 for _ in f)
+    except Exception:
+        pass
+    # ranges 选项: 中文标签 + 对应采样条数 (前端下拉直接渲染)
+    ranges_ui = [
+        {"value": "1h",  "label": "最近 1 小时", "samples": 60},
+        {"value": "6h",  "label": "最近 6 小时", "samples": 360},
+        {"value": "12h", "label": "最近 12 小时", "samples": 720},
+        {"value": "24h", "label": "最近 24 小时", "samples": 1440},
+        {"value": "3d",  "label": "最近 3 天",   "samples": 4320},
+        {"value": "7d",  "label": "最近 7 天",   "samples": 10080},
+    ]
+    return {
+        "ok": True,
+        "range": range,
+        "seconds": seconds,
+        "sample_interval_s": 60,
+        "retain_days": 7,
+        "total_history_records": total_raw,
+        "returned_points": len(points),
+        "max_points_cap": 360,
+        "ranges": ranges_ui,
+        "points": points,
+    }
 
 @app.get("/api/ntc")
 async def get_ntc():

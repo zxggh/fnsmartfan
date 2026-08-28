@@ -1,34 +1,53 @@
 /**
- * STC 智能风扇控制器 v2.1 — 前端(体验优化版)
+ * STC 智能风扇控制器 v6 — 前端(历史曲线大改版)
  *
- * 优化点:
- *   1. 执行按钮: 点下后立即用当前DOM上的温度值乐观更新UI(转速条/预览),
- *      不等后端串行8秒的真实返回; 请求在后台异步执行, 真实结果回来后再修正.
- *   2. 曲线图: 4条曲线(CPU/SSD/HDD/NTC环境), 系统识别到几种显示几种
- *      (连续无数据自动隐藏图例), X轴显示时间戳.
+ * 改进点:
+ *   1. 执行按钮: 乐观更新立即UI响应 (v5 已有)
+ *   2. 曲线图: 4条曲线 (CPU/SSD/HDD/环境NTC), 系统识别几种显示几种 (v5 已有)
+ *   3. ★ v6 核心: 后端持久化 + 前端范围选择器
+ *        - 后端 1 分钟采样写入 JSONL 到 /data (容器卷, 7 天保留)
+ *        - 前端下拉选 1h / 6h / 24h / 3d / 7d, 调 /api/temps/history 一次性拉整段历史
+ *        - 返回点数 > 360 时后端自动均值降采样, 画图不卡
+ *        - 只有短范围(≤6小时)时才在 poll 时追加实时点, 保持实时感
+ *   4. 静态文件版本号: ?v=4, 强制浏览器刷新缓存
  */
 const API = "";
 const POLL = 3000;
 let chart = null;
 
 // ── 全局缓存 ──
-// 最近一次 NTC 温度值(供 updateTemps 写入图表第4条曲线用,
-// 因为 /api/temps 和 /api/ntc 是两个独立接口, 轮询时需要合并)
+// 最近一次 NTC 温度值(供 updateTemps 写入图表第4条曲线用)
 let lastNtcValue = null;
-// 每种数据源连续"无有效数据"计数, 用于动态隐藏曲线图例
+// 每种数据源连续"无有效数据"计数, 用于短范围 append 模式下的动态隐藏
 let dataMissingCount = { cpu:0, ssd:0, hdd:0, ntc:0 };
-// 数据源显示名 → 数据集索引
 const DATASET_KEYS = ["cpu", "ssd", "hdd", "ntc"];
-// 图表最多保留的数据点数(3s/点 × 480 点 ≈ 24分钟).
-// 若需更长时间(如全天), 请在后端增加历史记录持久化API.
+// 兜底最多点数 (appendEnabled=true 但还没 loadHistory 完成时用)
 const CHART_MAX_POINTS = 480;
+
+// ── v6 新增: 历史曲线状态 ──
+const state = {
+  currentRange: "24h",           // 当前选择的范围
+  ranges: [],                    // 后端返回的 ranges 选项(备用)
+  appendEnabled: false,          // ≤6小时: poll 时继续追加实时点  >6小时: 只看历史快照
+  historyLabelsCount: 60,        // loadHistory 返回的 points 数, append 时按这个裁剪
+  historyLoaded: false,          // 首次 loadHistory 是否完成
+};
 
 document.addEventListener("DOMContentLoaded", () => {
   initChart();
   setTimeout(loadConfig, 500);
   setTimeout(loadAutoCmd, 600);
+  // v6: 图表初始化完成后再加载历史曲线 (给后端1.5s启动时间, 避免首帧接口报错)
+  setTimeout(() => loadHistory(state.currentRange), 1500);
   poll();
   setInterval(poll, POLL);
+  // v6: 绑定时间范围下拉框 change 事件
+  const sel = document.getElementById("range-select");
+  if (sel) {
+    sel.addEventListener("change", (e) => {
+      loadHistory(e.target.value);
+    });
+  }
 });
 
 // ── 自动命令发送开关 ──
@@ -142,7 +161,14 @@ function updateTemps(data) {
   }
 
   // ── 写入图表 (4条曲线) ──
+  // v6 关键改造:
+  //   - 看历史长范围(>6小时, appendEnabled=false): 不追加, 整图由 loadHistory 一次性重绘
+  //     目的: 不把 3s/点 的实时采集和后端 1分钟/点 的历史数据混在一起造成刻度混乱
+  //   - 短范围实时查看(≤6小时, appendEnabled=true): 继续每 3s append 一个点, 保持实时感
+  //     裁剪长度按 loadHistory 时记录的 historyLabelsCount (与后端范围点数对齐)
   if (!chart) return;
+  if (!state.appendEnabled) return;  // 长范围: 只更新卡片, 不改图表
+
   const now = new Date();
   const ts = now.toLocaleTimeString();  // HH:MM:SS
   chart.data.labels.push(ts);
@@ -169,8 +195,9 @@ function updateTemps(data) {
     }
   }
 
-  // 限制总点数, 超出就移除最早的
-  while (chart.data.labels.length > CHART_MAX_POINTS) {
+  // 限制总点数: 优先按 loadHistory 返回的范围点数, 兜底 480
+  const maxLen = Math.max(1, state.historyLabelsCount || CHART_MAX_POINTS);
+  while (chart.data.labels.length > maxLen) {
     chart.data.labels.shift();
     chart.data.datasets.forEach(ds => ds.data.shift());
   }
@@ -187,6 +214,89 @@ function updateNtc(data) {
     lastNtcValue = null;
     if (el) { el.textContent = "N/A"; el.className = "temp-val na"; }
   }
+}
+
+// ── v6 新增: 加载后端持久化的温度历史曲线, 整图重绘 ──
+async function loadHistory(range) {
+  range = range || state.currentRange;
+  state.currentRange = range;
+  // 如果下拉框当前值和 range 不一致, 同步一下 (双向绑定)
+  const sel = document.getElementById("range-select");
+  if (sel && sel.value !== range) sel.value = range;
+
+  try {
+    const r = await fetch(`${API}/api/temps/history?range=${encodeURIComponent(range)}`).then(r => r.json());
+    if (!r || !r.ok) throw new Error((r && r.error) || "接口返回失败");
+
+    // 顶部提示: 累计记录数 / 范围 / 显示点数 (让用户知道数据在慢慢累积)
+    const hint = document.getElementById("history-hint");
+    if (hint) {
+      hint.textContent =
+        `累计 ${r.total_history_records} 条记录（每分钟1条，保留${r.retain_days}天，` +
+        `本次显示 ${r.returned_points}/${r.max_points_cap} 点）`;
+    }
+
+    state.ranges = r.ranges || [];
+    state.historyLabelsCount = r.returned_points || 60;
+    // ≤6 小时=短范围实时查看: poll 时继续 append 最新点(追加到末尾, 保持实时感)
+    // >6 小时=长范围看历史: 不做 append, 避免 3s/点 实时采集和 1min/点 历史混合造成刻度混乱
+    state.appendEnabled = (r.seconds <= 6 * 3600);
+    // 整图重绘 (后端已做降采样 + X 轴 label 格式化)
+    rebuildChartFromHistory(r.points || []);
+    state.historyLoaded = true;
+  } catch (e) {
+    console.error("加载温度历史失败:", e);
+    const hint = document.getElementById("history-hint");
+    if (hint) {
+      hint.textContent =
+        `⚠️ 历史暂无数据（刚启动请等 1-2 分钟，或手动刷新页面重试）: ${e.message}`;
+    }
+    // 失败时允许退回到 append 模式 (防止首帧没加载上导致图表一直空)
+    state.appendEnabled = true;
+    state.historyLabelsCount = CHART_MAX_POINTS;
+  }
+}
+
+// ── v6 新增: 用后端返回的历史点, 一次性重建整张图表 (替代原 chart.push 追加模式) ──
+function rebuildChartFromHistory(points) {
+  if (!chart) return;
+  const labels = [];
+  const dData = [[], [], [], []];   // cpu/ssd/hdd/ntc
+  const hasData = { cpu:false, ssd:false, hdd:false, ntc:false };
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    // 后端已经按范围格式化好了: 短范围 HH:MM, 长范围 MM/DD HH:MM
+    labels.push(p.label);
+    const vals = [
+      (typeof p.cpu === "number" && !isNaN(p.cpu)) ? p.cpu : null,
+      (typeof p.ssd === "number" && !isNaN(p.ssd)) ? p.ssd : null,
+      (typeof p.hdd === "number" && !isNaN(p.hdd)) ? p.hdd : null,
+      (typeof p.ntc === "number" && !isNaN(p.ntc)) ? p.ntc : null,
+    ];
+    for (let k = 0; k < 4; k++) {
+      dData[k].push(vals[k]);
+      if (vals[k] != null) hasData[DATASET_KEYS[k]] = true;
+    }
+  }
+  chart.data.labels = labels;
+  for (let i = 0; i < 4; i++) {
+    chart.data.datasets[i].data = dData[i];
+    // 整条曲线一个点都没有 → 隐藏图例和线条 (系统没有这个温度源)
+    chart.data.datasets[i].hidden = !hasData[DATASET_KEYS[i]];
+  }
+  // 不同范围的视觉调整:
+  //   - >1天: maxTicksLimit 调到 6, 避免跨日刻度文字堆叠
+  //   - spanGaps: 短范围 false (缺数据断开更真实), 长范围 true (合并桶后点更均匀, 连线更顺)
+  const SEC_24H = 24 * 3600;
+  const RANGE_SEC = {
+    "1h": 3600, "6h": 6*3600, "12h":12*3600, "24h": SEC_24H,
+    "3d": 3*86400, "7d":7*86400,
+  }[state.currentRange] || SEC_24H;
+  chart.options.scales.x.ticks.maxTicksLimit = RANGE_SEC > SEC_24H ? 6 : 8;
+  chart.options.spanGaps = RANGE_SEC > SEC_24H;
+  chart.update("none");
+  // 重置 dataMissingCount: 历史数据里自动判定了 hidden, 后面 append 从零重新开始累计
+  for (const k of DATASET_KEYS) dataMissingCount[k] = 0;
 }
 
 function updateFans(data) {

@@ -105,6 +105,51 @@ main {
   transform: scale(1.03);
 }
 
+/* v6 新增: 温度卡片头部 — 左标题 + 右操作(历史累计提示 + 时间范围下拉) */
+.temp-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.temp-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.history-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: normal;
+}
+.range-select {
+  padding: 5px 10px;
+  font-size: 12px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+  outline: none;
+}
+.range-select:hover {
+  border-color: var(--primary);
+  background: var(--card-hover);
+}
+.range-select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(59,130,246,0.15);
+}
+.range-select option {
+  background: #162033;
+  color: var(--text);
+  font-size: 12px;
+}
+
 /* 原始命令卡片: 自动命令开关布局 */
 .auto-cmd-switch {
   display: flex; align-items: center; gap: 8px;

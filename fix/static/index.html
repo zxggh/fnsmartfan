@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>智能风扇控制器</title>
-<link rel="stylesheet" href="/static/style.css?v=3">
+<link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
 <header>
@@ -22,7 +22,21 @@
   <!-- 左栏: 仪表盘 -->
   <section class="dashboard">
     <div class="card temp-card">
-      <div class="card-header">🌡️ 系统温度</div>
+      <div class="card-header temp-header-row">
+        <span>🌡️ 系统温度</span>
+        <!-- v6 新增: 历史曲线时间范围选择 + 累计记录数提示 -->
+        <div class="temp-header-actions">
+          <span id="history-hint" class="history-hint">累计 -- 条记录（每分钟1条，保留7天）</span>
+          <select id="range-select" class="range-select" title="选择温度曲线显示的时间范围">
+            <option value="1h">最近 1 小时</option>
+            <option value="6h">最近 6 小时</option>
+            <option value="12h">最近 12 小时</option>
+            <option value="24h" selected>最近 24 小时</option>
+            <option value="3d">最近 3 天</option>
+            <option value="7d">最近 7 天</option>
+          </select>
+        </div>
+      </div>
       <div class="card-body">
         <div class="temp-grid">
           <div class="temp-item"><label>CPU</label><span id="cpu-temp" class="temp-val">--</span></div>
@@ -128,6 +142,6 @@
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<script src="/static/app.js?v=3"></script>
+<script src="/static/app.js?v=4"></script>
 </body>
 </html>
