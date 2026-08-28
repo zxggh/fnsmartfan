@@ -24,13 +24,19 @@ body {
 header {
   display: flex; justify-content: space-between; align-items: center;
   padding: 16px 24px; background: var(--card); border-bottom: 1px solid var(--border);
+  flex-wrap: nowrap;     /* 手机端也强制一行, 不换行 */
+  gap: 8px;              /* 左右间距不够时, 徽标不会被挤换行 */
 }
-.header-left h1 { font-size: 20px; font-weight: 600; }
+.header-left {
+  display: flex; flex-direction: column; justify-content: center;
+  min-width: 0;          /* 允许文字缩小, 不抢占徽标空间 */
+}
+.header-left h1 { font-size: 20px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .subtitle { font-size: 12px; color: var(--text-muted); margin-left: 8px; }
-.header-right { display: flex; align-items: center; gap: 16px; }
-.badge { font-size: 12px; padding: 4px 12px; border-radius: 12px; background: var(--border); color: var(--text-muted); }
+.header-right { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.badge { font-size: 12px; padding: 4px 10px; border-radius: 12px; background: var(--border); color: var(--text-muted); white-space: nowrap; }
 .badge.online { background: #1a3a2a; color: var(--success); }
-.uptime { font-size: 12px; color: var(--text-muted); }
+.uptime { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
 
 main {
   display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
@@ -67,6 +73,37 @@ main {
 .gauge-fill { height: 100%; background: linear-gradient(90deg, var(--success), var(--warning), var(--danger)); border-radius: 10px; transition: width 0.5s ease; }
 .fan-info { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); }
 .fan-info strong { color: var(--text); }
+
+/* ★ v6 修复: 温控配置卡片的双层 Header
+   PC / 宽屏: 标题占左, 说明文字+执行/默认按钮 占右, 横向排列
+   手机端: 标题独占第一行, 「说明+按钮」组自动落到第二行, 不再挤在一行导致换行 */
+.ctrl-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.ctrl-header-title {
+  font-size: 14px;
+  font-weight: 600;
+  /* 标题永不缩小抢占按钮空间: 手机端会自然换行到第二行 (见 @media <=680px) */
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.ctrl-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
+  min-width: 0;
+}
+.ctrl-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 
 /* 温控配置 */
 .ctrl-row {
@@ -108,22 +145,30 @@ main {
 /* v6 新增: 温度卡片头部 — 左标题 + 右操作(历史累计提示 + 时间范围下拉) */
 .temp-header-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;     /* 手机端纵向排列时顶部对齐, 避免错位 */
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 10px;
 }
 .temp-header-actions {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 10px;
   margin-left: auto;
   flex-shrink: 0;
+  min-width: 0;
+  /* 手机端 < 520px: 自动变成纵向排列, 累计记录文字换行, 时间下拉框完整显示 */
+  max-width: 100%;
 }
 .history-hint {
   font-size: 11px;
   color: var(--text-muted);
   font-weight: normal;
+  /* ★ v6 修复: 手机端允许换行, 不抢占下拉框空间 (长文字自动折到第 2 行) */
+  line-height: 1.4;
+  word-break: break-all;
+  flex: 1 1 auto;
 }
 .range-select {
   padding: 5px 10px;
@@ -135,6 +180,10 @@ main {
   cursor: pointer;
   transition: all 0.2s;
   outline: none;
+  /* ★ v6 修复: 时间范围选择框最小宽度, 不会被挤没, 手机端也能完整展开 */
+  min-width: 118px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .range-select:hover {
   border-color: var(--primary);
@@ -208,6 +257,55 @@ main {
   main { grid-template-columns: 1fr; }
   .temp-grid { grid-template-columns: repeat(2, 1fr); }
   .fan-grid { grid-template-columns: 1fr; }
+}
+
+/* ★ v6 手机端专项修复 (<=680px 典型小屏) */
+@media (max-width: 680px) {
+  header { padding: 12px 14px; gap: 6px; }
+  /* 标题字号缩小, 徽标和运行时间保证占空间, 不被挤到下一行 */
+  .header-left h1 { font-size: 16px; }
+  .subtitle { font-size: 11px; margin-left: 4px; }
+  .header-right { gap: 8px; }
+  .badge { font-size: 11px; padding: 3px 8px; }
+  .uptime { font-size: 11px; }
+
+  /* 温度卡片 header: 累计记录提示 + 时间下拉框 纵向排列, 各占一行不互挤 */
+  .temp-header-actions {
+    flex-direction: column;
+    align-items: stretch;
+    margin-left: 0;
+    width: 100%;
+    gap: 6px;
+  }
+  .history-hint {
+    width: 100%;
+    flex: none;
+  }
+  .range-select {
+    min-width: 0;
+    width: 100%;
+    text-align: center;
+  }
+  .temp-header-row {
+    align-items: flex-start;
+  }
+
+  /* v6 二次修复: 温控配置 header — 手机端上下两行 (标题独占第一行, 说明+执行/默认按钮 独占第二行)
+     不再像之前那样 4 个元素挤一行导致文字被截断换行 */
+  .ctrl-card-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .ctrl-header-title {
+    width: 100%;
+    font-size: 14px;
+  }
+  .ctrl-header-actions {
+    margin-left: 0;
+    width: 100%;
+    /* 如果说明+按钮组还是挤不下, 允许再折一行, 但不会再和标题互挤了 */
+    justify-content: space-between;
+  }
 }
 
 /* 断连记录卡片(左栏, 可折叠) */

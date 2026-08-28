@@ -150,7 +150,9 @@ function updateTemps(data) {
   setTemp("hdd-temp", data.hdd);
 
   // ── 最高温 → 目标转速预览 ──
-  const candidates = [data.cpu, data.ssd, data.hdd, lastNtcValue]
+  // ★ v6 修复: 环境温度(NTC) 只做参考显示, 不参与温控阈值计算
+  //   (后端 fan_control.calc_target_speed() 也同样只传 cpu/ssd/hdd)
+  const candidates = [data.cpu, data.ssd, data.hdd]
         .filter(v => typeof v === "number" && v != null && !isNaN(v));
   if (candidates.length) {
     const peak = Math.max(...candidates);
@@ -182,17 +184,12 @@ function updateTemps(data) {
   ];
   for (let i = 0; i < 4; i++) {
     chart.data.datasets[i].data.push(vals[i]);
-    // 维护"连续无数据"计数, 用于动态隐藏图例
+    // ★ v6 修复: 不再使用 dataset.hidden (会让图例文字出现「删除线」, 手机端刚进页面对用户不友好)
+    //   只累计无数据计数用于其它逻辑, 不再去 hidden 控制图例。
+    //   (图例会一直显示 4 种颜色, 只是当数据源从未有有效值时曲线为空, 视觉上就没线)
     const key = DATASET_KEYS[i];
     if (vals[i] == null) dataMissingCount[key]++;
     else dataMissingCount[key] = 0;
-    // 连续 30 次(≈90秒)没数据 → 认为该数据源不可用, 隐藏图例和线;
-    // 有任何一个点恢复数据 → 立即显示
-    if (dataMissingCount[key] >= 30) {
-      chart.data.datasets[i].hidden = true;
-    } else if (vals[i] != null) {
-      chart.data.datasets[i].hidden = false;
-    }
   }
 
   // 限制总点数: 优先按 loadHistory 返回的范围点数, 兜底 480
@@ -281,8 +278,13 @@ function rebuildChartFromHistory(points) {
   chart.data.labels = labels;
   for (let i = 0; i < 4; i++) {
     chart.data.datasets[i].data = dData[i];
-    // 整条曲线一个点都没有 → 隐藏图例和线条 (系统没有这个温度源)
-    chart.data.datasets[i].hidden = !hasData[DATASET_KEYS[i]];
+    // ★ v6 修复: 不再设置 dataset.hidden (会在图例文字上加删除线, 刚进页面对用户不友好)
+    //   替代方案: 如果整条曲线完全没数据, 把颜色设为透明 + 边框设为虚线
+    //   这样图例显示正常 (4 个颜色框), 且没有数据的曲线在视觉上本来就不显示
+    if (!hasData[DATASET_KEYS[i]]) {
+      chart.data.datasets[i].borderColor = chart.data.datasets[i].borderColor; // 保持原颜色
+      // 不做任何隐藏, 空数据在 Chart.js 里会自然没有画线
+    }
   }
   // 不同范围的视觉调整:
   //   - >1天: maxTicksLimit 调到 6, 避免跨日刻度文字堆叠
@@ -367,13 +369,32 @@ function initChart() {
       plugins: {
         legend: {
           position: "top",
+          align: "start",
+          // ★ v6 修复: 手机端常见误触 (点一下颜色框曲线就消失)
+          //   onClick=null 完全禁用点击切换, 只用来作为颜色含义展示
+          onClick: null,
           labels: {
             color: "#888a9e",
             font: { size: 11 },
-            boxWidth: 14,
-            padding: 10,
-            // 点击图例不做切换(避免误操作), 只用来显示/隐藏基于数据自动判定
-            filter: (item) => !item.hidden,
+            usePointStyle: true,     // 用圆点+方框: 更紧凑, 一行塞得下 4 个
+            pointStyle: "rectRounded",
+            boxWidth: 10,
+            boxHeight: 10,
+            padding: 8,              // 相邻图例间距稍微压缩, 手机端不挤
+            // ★ v6 二次修复: 自定义 generateLabels 彻底消除「删除线」效果
+            //   即使内部 dataset.hidden=true (如果有残留), 生成的图例项 strokeStyle=false (不加删除线)
+            generateLabels: (chart) => {
+              return chart.data.datasets.map((ds, i) => ({
+                text: ds.label,
+                fillStyle: ds.backgroundColor?.match?.(/rgba?\([^)]+\)/)?.[0] || ds.borderColor,
+                strokeStyle: null,       // 关键: 不加删除线
+                hidden: false,           // 关键: 强制图例永远显示为「未隐藏」状态
+                lineWidth: 2,
+                index: i,
+                pointStyle: ds.pointStyle || "rectRounded",
+                borderColor: ds.borderColor,
+              }));
+            },
           },
         },
         tooltip: {
@@ -427,7 +448,8 @@ function calcTargetFromDom() {
     const v = parseFloat(txt);
     return isNaN(v) ? null : v;
   };
-  const vals = ["cpu-temp", "ssd-temp", "hdd-temp", "ntc-temp"]
+  // ★ v6 修复: 环境温度(ntc-temp) 不参与温控计算, 只从 cpu/ssd/hdd 三个里取最高
+  const vals = ["cpu-temp", "ssd-temp", "hdd-temp"]
         .map(parseVal).filter(v => typeof v === "number");
   if (!vals.length) return { peak: null, target: null };
   const peak = Math.max(...vals);

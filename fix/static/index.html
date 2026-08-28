@@ -83,11 +83,16 @@
   <!-- 右栏: 控制面板 -->
   <section class="control-panel">
     <div class="card">
-      <div class="card-header">
-        <span>⚙️ 温控配置</span>
-        <span style="font-size:11px;color:var(--text-muted)">取最高温→线性映射→设风扇</span>
-        <button class="btn btn-sm btn-primary" onclick="runControl()">▶ 执行</button>
-        <button class="btn btn-sm" onclick="resetControl()">↺ 默认</button>
+      <!-- v6 修复: 温控配置卡片 header 双层布局
+           - 左: 标题独占一行 (「⚙️ 温控配置」)
+           - 右 actions 组: 说明文字 + 执行/默认按钮, 手机端自动跳到第二行, 不再拥挤 -->
+      <div class="card-header ctrl-card-header">
+        <div class="ctrl-header-title">⚙️ 温控配置</div>
+        <div class="ctrl-header-actions">
+          <span class="ctrl-desc">取最高温→线性映射→设风扇</span>
+          <button class="btn btn-sm btn-primary" onclick="runControl()">▶ 执行</button>
+          <button class="btn btn-sm" onclick="resetControl()">↺ 默认</button>
+        </div>
       </div>
       <div class="card-body">
         <div class="ctrl-row">
