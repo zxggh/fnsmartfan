@@ -12,7 +12,9 @@
  *   4. 静态文件版本号: ?v=4, 强制浏览器刷新缓存
  */
 const API = "";
-const POLL = 3000;
+const POLL = 500; // v7优化: 从1500ms再缩到500ms, 风扇转速确认轮询更及时
+                 // 温度采集/auto_control 是 3s 周期, 风扇POLL 500ms不会增加任何NAS负载
+                 // (仅是读controller.speed_cache内存变量, 不发串口命令, <1ms)
 let chart = null;
 
 // ── 全局缓存 ──
@@ -435,9 +437,32 @@ document.addEventListener("change", e => {
   if (e.target.id === "ctrl-start" || e.target.id === "ctrl-max") {
     const start = parseInt(document.getElementById("ctrl-start").value) || 0;
     const max = parseInt(document.getElementById("ctrl-max").value) || 0;
+    // ── ★ 严格遵守规则: 进度条更新只能来自控制器返回的确认转速
+    //    前端在这里不做任何乐观更新, 进度条要等后端 PUT 返回的
+    //    immediate.send_result.value (即 set_fan_speed 解析到的 F1_CPD=xx% 确认值)
+    //    才更新, 或等后续 poll /api/status 读到缓存更新.
+    //  后台发PUT保存配置 + 立即下发真命令 (不await, 不阻塞UI)
     fetch(`${API}/api/control`, {
       method:"PUT", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({start, max}),
+    }).then(async r => {
+      try {
+        const jr = await r.json();
+        // 后端返回的 immediate: {target_speed, send_result: {ok, value}}
+        // send_result.value 就是 set_fan_speed 从控制器 RX "F1_CPD=xx%" 里解析出来的确认值
+        // → 这是"收到控制器返回的转速", 合法地更新进度条
+        if (jr && jr.ok && jr.immediate && typeof jr.immediate.send_result === "object"
+            && jr.immediate.send_result.ok && typeof jr.immediate.send_result.value === "number") {
+          applyOptimisticFanSpeed(jr.immediate.send_result.value);
+          updateFans({
+            ok: true, auto_cmd_enabled: autoCmdEnabled,
+            fan1: { "转速": jr.immediate.send_result.value + "%" },
+            fan2: { "转速": "--" },
+          });
+          // 再触发一次刷新(后台跑), 让其余数据(温度/图表等)和真采温度对齐
+          refreshFansNow();
+        }
+      } catch(_) {}
     }).catch(()=>{});
     // 配置改了, 立即重算预览
     syncPreviewFromDom();
@@ -534,13 +559,20 @@ async function runControl() {
     try {
       const r = await fetch(`${API}/api/control/run`, {method:"POST"}).then(r => r.json());
       if (r.ok) {
-        // 后端真实返回: 用真实值再覆盖一次, 修正乐观计算可能的偏差
-        // (例如刚执行完温度有变化, 或控制器实际和理论有误差)
-        if (typeof r.target_speed === "number") {
-          applyOptimisticFanSpeed(r.target_speed);
+        // v7优化: 后端返回里已经包含 set_fan_speed 的确认值(fan1/fan2)
+        // 直接用确认值更新进度条, 不再等 refreshFansNow 额外请求, 快1~2秒
+        const confirmed = typeof r.fan1 === "number" ? r.fan1 : r.target_speed;
+        if (typeof confirmed === "number") {
+          applyOptimisticFanSpeed(confirmed);
         }
-        // 触发一次立即刷新, 让卡片/图表和控制器真实状态对齐
-        // (不再等3秒轮询自动来, 但这里也不 await, 让它在后台跑)
+        // 手动构造一个类似 /api/status 的结构传给 updateFans, 同步刷新 F1/F2 卡片
+        updateFans({
+          ok: true,
+          auto_cmd_enabled: autoCmdEnabled,
+          fan1: { "转速": (typeof r.fan1 === "number" ? r.fan1 : "--") + (typeof r.fan1 === "number" ? "%" : "") },
+          fan2: { "转速": (typeof r.fan2 === "number" ? r.fan2 : "--") + (typeof r.fan2 === "number" ? "%" : "") },
+        });
+        // 触发一次后台刷新(不await, 不阻塞), 用于对齐温度/图表等其余数据
         refreshFansNow();
       }
     } catch(e) { console.error("runControl 后台执行失败:", e); }

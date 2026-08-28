@@ -24,9 +24,10 @@ v4 修复:
 """
 
 import os, sys, json, yaml, time, logging, asyncio
+from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Tuple
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -74,6 +75,96 @@ disc_log: Optional[DisconnectLogger] = None
 # v6 新增: 温度历史持久化实例 (后台 60s 采样, 7 天 JSONL 存 /data)
 temp_history: Optional[TempHistory] = None
 start_time = time.time()
+
+# ── v7 新增: 温度采集缓存 (解决滑块change后 PUT /api/control 立即下发要等 5s 的问题)
+#    temp_collector.collect_all() 要读 SMART/HDD 等, 单次 3~5s.
+#    auto_control (3s 周期) / history_collector / run_control 一直在刷新温度,
+#    所以 PUT /api/control 没必要重采, 用 <=3s 内的缓存即可, 立即下发快 10 倍.
+_TEMPS_CACHE_DATA: Optional[dict] = None
+_TEMPS_CACHE_TIME: float = 0.0       # 缓存"开始采集"的时间戳 (真采开始时就写, 不是完成时!)
+# v7 修复: max_age 从 2.5s → 12s
+#   ★ 原BUG（时间窗口悖论）: NAS 扫 HDD SMART 真采一次要 3~8s，旧 max_age=2.5s
+#     导致每次真采完成后，缓存里写的 age 其实已经 = 采集耗时(8s) > 2.5s
+#     → 下一次 collect_temps_cached 永远判定 "缓存已过期" → 100% 真采 → 永远 5s 延迟
+#   修复: 温度是慢变化物理量，12s 的缓存对人无感，但 12s > 最坏采集耗时 8s → 必定命中
+_TEMPS_CACHE_MAX_AGE: float = 12.0
+
+async def collect_temps_cached(max_age_s: float = _TEMPS_CACHE_MAX_AGE) -> dict:
+    """温度采集(带缓存包装): max_age_s 秒内有缓存直接返回, 否则真采一次并写缓存.
+
+    所有需要温度的地方(立即下发/auto_control/run_control/历史采样)都应走这个包装,
+    避免重复扫 SMART → 5 秒延迟.
+
+    ★ 时间戳策略: 真采"开始前"就写 _TEMPS_CACHE_TIME, 不是完成后.
+      这样即使采集花了 8 秒, 完成后后续请求的 age=8s < 12s → 缓存命中.
+    """
+    global _TEMPS_CACHE_DATA, _TEMPS_CACHE_TIME
+    now = time.time()
+    age = (now - _TEMPS_CACHE_TIME) if _TEMPS_CACHE_DATA is not None else None
+    if (_TEMPS_CACHE_DATA is not None and age is not None and age <= max_age_s):
+        logger.info(f"collect_temps_cached: 缓存命中 (age={age:.1f}s <= max_age={max_age_s:.0f}s)")
+        return _TEMPS_CACHE_DATA
+    # 缓存失效/为空: 真采
+    if temp_collector is None:
+        return {}
+    # ★ 关键: 开始真采"前"就写时间戳(而不是完成后)
+    #   这样就算这次采了 8s, 完成后后续请求的 age=8s, 仍然在 12s 窗口内
+    _TEMPS_CACHE_TIME = time.time()
+    t0 = time.time()
+    miss_reason = "空缓存" if _TEMPS_CACHE_DATA is None else f"过期 (age={age:.1f}s > max_age={max_age_s:.0f}s)"
+    logger.info(f"collect_temps_cached: 缓存未命中({miss_reason}), 开始真采...")
+    data = await temp_collector.collect_all()
+    cost = round(time.time() - t0, 2)
+    _TEMPS_CACHE_DATA = data
+    # ★ 注意: _TEMPS_CACHE_TIME 不再重新赋值! 保持"开始真采"那一刻的值
+    #   (这样完成后后续请求的 age = cost, 仍 < 12s, 命中)
+    logger.info(f"collect_temps_cached: 真采完成, 耗时 {cost}s (>=1s属正常: 扫HDD SMART). 缓存生效窗口剩余 ~{max(0, max_age_s - cost):.0f}s")
+    return data
+
+
+def _extract_temp_sensors(td: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """从 temp_collector.collect_all() 返回的大 dict 中统一提取 (CPU, SSD, HDD).
+
+    原代码在 auto_control / update_control / reset_control / run_control
+    / history_collector / GET /api/temps 里重复了 6 遍相同的核心提取逻辑,
+    极易出现 copy-paste 不一致 BUG. 现在统一走这个函数.
+    """
+    # CPU: 找 coretemp 键下的所有数值, 取最高
+    cpu: Optional[float] = None
+    for k, v in td.items():
+        if "coretemp" in k and isinstance(v, dict):
+            vals = [x for x in v.values() if isinstance(x, (int, float))]
+            if vals:
+                cpu = round(float(max(vals)), 1)
+                break
+    # SSD: hwmon_nvme.temp1_input
+    ssd = td.get("hwmon_nvme", {}).get("temp1_input")
+    if not isinstance(ssd, (int, float)) or isinstance(ssd, bool):
+        # 兼容某些 hwmon0/hwmon1 路径 (nvme不一定挂在hwmon_nvme)
+        for k, v in td.items():
+            if isinstance(k, str) and k.startswith("hwmon_") and isinstance(v, dict):
+                candidate = v.get("temp1_input")
+                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                    ssd = candidate
+                    break
+            else:
+                continue
+    # HDD: 优先 hdd.temperature (多盘已取max), 兜底 disk_sda.temperature
+    hdd = None
+    if isinstance(td.get("hdd"), dict):
+        hdd = td["hdd"].get("temperature")
+    if hdd is None and isinstance(td.get("disk_sda"), dict):
+        hdd = td["disk_sda"].get("temperature")
+    if not isinstance(hdd, (int, float)) or isinstance(hdd, bool):
+        # 最后兜底: 任何 disk_* 键里的 temperature
+        for k, v in td.items():
+            if isinstance(k, str) and k.startswith("disk_") and isinstance(v, dict):
+                candidate = v.get("temperature")
+                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                    hdd = candidate
+                    break
+    return cpu, float(ssd) if isinstance(ssd, (int, float)) and not isinstance(ssd, bool) else None, \
+           float(hdd) if isinstance(hdd, (int, float)) and not isinstance(hdd, bool) else None
 
 # ── 自动命令发送使能开关(调试用) ──
 # True: 正常按时间下发心跳/温控命令   False: 停止自动发送, 但允许手动发送
@@ -134,6 +225,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"控制器连接失败: {e}")
         disc_log.start()
+
+    # ── v7 温度缓存预热 (解决容器刚启动3秒内首次操作真采5秒问题) ──
+    #   容器刚启动: auto_control要等3秒, history_collector要等10秒才第一次采温度
+    #   此时若用户立刻点「▶ 执行」或改配置: _TEMPS_CACHE_DATA 为空 → 真采 3~5s
+    #   这里在 lifespan 最后异步启动一个预热任务, 后台立刻采一次温度填缓存, 不阻塞启动
+    async def _warmup_temp_cache():
+        try:
+            # 稍微等 0.5s, 让 controller/heartbeat 初始化完
+            await asyncio.sleep(0.5)
+            t0 = time.time()
+            result = await collect_temps_cached(max_age_s=99999)  # 强制真采
+            cost = round(time.time() - t0, 2)
+            if result:
+                logger.info(f"[缓存预热] 完成, 耗时{cost}s, 温度CPU={_TEMPS_CACHE_DATA.get('coretemp')} SSD={_TEMPS_CACHE_DATA.get('hwmon_nvme')} HDD={_TEMPS_CACHE_DATA.get('hdd') or _TEMPS_CACHE_DATA.get('disk_sda')}")
+            else:
+                logger.warning(f"[缓存预热] 无数据, 耗时{cost}s")
+        except Exception as e:
+            logger.warning(f"[缓存预热] 失败(不影响服务, 后续调用会自动真采): {e}")
+    _ = asyncio.create_task(_warmup_temp_cache())
     # 后台心跳保活任务(v4: 节奏降到 3.5s, 远离 STC 5s 复位窗口)
     # 连续2次ping失败才判定断连(v4: ping 单次失败不再立即置 _connected=False, 避免抖动误判)
     # ★ 自动命令开关关闭(auto_cmd_enabled=False)时: 跳过自动心跳, 不占用串口
@@ -201,13 +311,15 @@ async def lifespan(app: FastAPI):
         new_task.add_done_callback(_hb_done_callback)
     task_hb.add_done_callback(_hb_done_callback)
 
-    # 后台自动控温任务(每10秒计算温控, 转速变化才发送, 降低命令量)
+    # 后台自动控温任务(每3秒计算温控, 转速变化才发送, 降低命令量)
     # ★ 自动命令开关关闭(auto_cmd_enabled=False)时: 跳过自动控温, 但手动/API仍可用
+    # ★ v7优化: 轮询周期从10s缩短到3s, 提升温控响应速度
+    # ★ v7修复: 只控制 F1 (系统只有一个风扇, F2 不存在, 不要再下发 F2CPD 命令)
     async def auto_control():
         last_target = None
         while True:
             try:
-                await asyncio.sleep(10)
+                await asyncio.sleep(3)
                 # ── 自动命令开关: 关闭时跳过自动控温 ──
                 if not auto_cmd_enabled:
                     continue
@@ -215,29 +327,23 @@ async def lifespan(app: FastAPI):
                     continue
                 if not controller.connected:
                     continue
-                td = await temp_collector.collect_all()
-                cpu = None
-                for k, v in td.items():
-                    if "coretemp" in k and isinstance(v, dict):
-                        vals = [x for x in v.values() if isinstance(x, (int, float))]
-                        if vals:
-                            cpu = round(max(vals), 1)
-                ssd = td.get("hwmon_nvme", {}).get("temp1_input")
-                # HDD 温度: 优先用 temp_collector 汇总的多盘最高温(hdd键), 兜底 disk_sda
-                hdd = td.get("hdd", {}).get("temperature")
-                if hdd is None:
-                    hdd = td.get("disk_sda", {}).get("temperature")
+                td = await collect_temps_cached()
+                # 统一走公共函数提取 CPU/SSD/HDD (原重复6处copy-paste容易出错)
+                cpu, ssd, hdd = _extract_temp_sensors(td)
                 target = fan_control.calc_target_speed(cpu, ssd, hdd)
-                # 只有目标转速变化时才下发, 只控制风扇1
-                # set_fan_speed 会等控制器确认, 3次无响应返回失败(不更新缓存)
+                # 只有目标转速变化时才下发, 只控制 F1 (无 F2)
+                # set_fan_speed 会等控制器确认, 2次无响应返回失败(不更新缓存)
                 if target != last_target:
-                    r = await controller.set_fan_speed(1, target)
-                    if r.get("ok"):
+                    r1 = await controller.set_fan_speed(1, target)
+                    if r1.get("ok"):
                         last_target = target
+                        logger.info(f"[auto_control] 目标{target}% → F1={r1.get('value')}%")
+                    else:
+                        logger.warning(f"[auto_control] 目标{target}% → F1设置失败")
             except Exception as e:
                 # v4: 兜底, auto_control 也加保护
-                logger.error(f"auto_control 异常(已吞掉, 10秒后继续): {e}", exc_info=True)
-                await asyncio.sleep(10)
+                logger.error(f"auto_control 异常(已吞掉, 3秒后继续): {e}", exc_info=True)
+                await asyncio.sleep(3)
     task_ac = asyncio.create_task(auto_control())
 
     # v6 新增: 温度历史采集任务 (每 60 秒采样 1 次, 写 JSONL 到 /data, 7 天保留)
@@ -256,17 +362,8 @@ async def lifespan(app: FastAPI):
                 if not (temp_history and temp_collector):
                     continue
                 # 采集 NAS 温度 (CPU/SSD/HDD)
-                td = await temp_collector.collect_all()
-                cpu = None
-                for k, v in td.items():
-                    if "coretemp" in k and isinstance(v, dict):
-                        vals = [x for x in v.values() if isinstance(x, (int, float))]
-                        if vals:
-                            cpu = round(max(vals), 1)
-                ssd = td.get("hwmon_nvme", {}).get("temp1_input")
-                hdd = td.get("hdd", {}).get("temperature")
-                if hdd is None:
-                    hdd = td.get("disk_sda", {}).get("temperature")
+                td = await collect_temps_cached()
+                cpu, ssd, hdd = _extract_temp_sensors(td)
                 # NTC 从缓存读 (不占串口, ping 每 3.5s 就在刷新缓存)
                 ntc = None
                 if controller:
@@ -354,19 +451,8 @@ async def get_temps():
     if not temp_collector:
         return {"ok": False, "error": "未初始化"}
     try:
-        data = await temp_collector.collect_all()
-        # 提取关键值
-        cpu = None
-        for k, v in data.items():
-            if "coretemp" in k and isinstance(v, dict):
-                vals = [x for x in v.values() if isinstance(x, (int, float))]
-                if vals:
-                    cpu = round(max(vals), 1)
-        ssd = data.get("hwmon_nvme", {}).get("temp1_input")
-        # HDD 温度: 优先用 temp_collector 汇总的多盘最高温(hdd键), 兜底 disk_sda
-        hdd = data.get("hdd", {}).get("temperature")
-        if hdd is None:
-            hdd = data.get("disk_sda", {}).get("temperature")
+        data = await collect_temps_cached()
+        cpu, ssd, hdd = _extract_temp_sensors(data)
         return {"ok": True, "data": {
             "cpu": cpu, "ssd": ssd, "hdd": hdd,
             "raw": {k: v for k, v in data.items()
@@ -488,19 +574,52 @@ async def get_control_config():
 
 @app.put("/api/control")
 async def update_control(req: ControlUpdate):
-    """更新温控参数(启动温度/最高温度)."""
+    """更新温控参数(启动温度/最高温度) - v7: 更新后立即下发一次风扇转速."""
     if not fan_control:
         return {"ok": False, "error": "未初始化"}
     fan_control.update_config(req.start, req.max)
-    return {"ok": True, "config": fan_control.config}
+    # ── v7优化: 配置变更后立即计算并下发, 不等3秒轮询周期 ──
+    immediate_result = None
+    try:
+        if controller and controller.connected and temp_collector:
+            # ★ 必须走缓存包装! auto_control 3s周期本来就在刷新, 直接复用 <=12s 内缓存
+            #   不走 temp_collector.collect_all() (真采要 3~8s, 就是之前用户说的5秒延迟根源)
+            td = await collect_temps_cached()
+            cpu, ssd, hdd = _extract_temp_sensors(td)
+            target = fan_control.calc_target_speed(cpu, ssd, hdd)
+            r = await controller.set_fan_speed(1, target)
+            immediate_result = {"target_speed": target, "send_result": r}
+            logger.info(f"[温控配置更新] 立即下发: CPU={cpu} SSD={ssd} HDD={hdd} → F1={target}% 结果={r.get('ok')}")
+    except Exception as e:
+        logger.warning(f"[温控配置更新] 立即下发失败(不影响配置保存): {e}")
+    resp = {"ok": True, "config": fan_control.config}
+    if immediate_result:
+        resp["immediate"] = immediate_result
+    return resp
 
 @app.post("/api/control/reset")
 async def reset_control():
-    """恢复默认温控参数."""
+    """恢复默认温控参数 - v7: 更新后立即下发一次风扇转速."""
     if not fan_control:
         return {"ok": False, "error": "未初始化"}
     fan_control.reset_config()
-    return {"ok": True, "data": DEFAULT_CONFIG}
+    # ── v7优化: 配置变更后立即计算并下发, 不等3秒轮询周期 ──
+    immediate_result = None
+    try:
+        if controller and controller.connected and temp_collector:
+            # ★ 同上: 走缓存包装, 避免真采 3~8s 延迟
+            td = await collect_temps_cached()
+            cpu, ssd, hdd = _extract_temp_sensors(td)
+            target = fan_control.calc_target_speed(cpu, ssd, hdd)
+            r = await controller.set_fan_speed(1, target)
+            immediate_result = {"target_speed": target, "send_result": r}
+            logger.info(f"[温控配置重置] 立即下发: CPU={cpu} SSD={ssd} HDD={hdd} → F1={target}% 结果={r.get('ok')}")
+    except Exception as e:
+        logger.warning(f"[温控配置重置] 立即下发失败(不影响配置保存): {e}")
+    resp = {"ok": True, "data": DEFAULT_CONFIG}
+    if immediate_result:
+        resp["immediate"] = immediate_result
+    return resp
 
 # ═══════════════ 控制回路 ═══════════════
 
@@ -510,50 +629,59 @@ async def run_control():
     执行一次完整温控:
       1. 采集 NAS 温度 (CPU/SSD/HDD)
       2. 按配置计算目标转速
-      3. 设置 F1 和 F2 转速
-      4. 读取 NTC 环境温度
+      3. 设置 F1 和 F2 转速 (用 set_fan_speed, 从确认响应解析并更新缓存, 不再二次查询)
+      4. 读取 NTC 环境温度 (从缓存读, ping 每 3.5s 就在刷新)
       5. 返回所有结果
+
+    ★ v7修复: 不再 send_raw 组合命令后再 get_fan_speed 查询两次.
+       set_fan_speed 发送 F1CPD=xx 后, 控制器回复 F1CPD=xx%, 直接解析这个确认值
+       并写入 speed_cache. 省掉 2 条 F1CPD? / F2CPD? 查询命令, 减少 2~4 秒延迟.
     """
     if not fan_control:
         return {"ok": False, "error": "未初始化"}
     if not controller or not controller.connected:
         return {"ok": False, "error": "控制器未连接"}
 
-    # 1. 采集 NAS 温度
-    temps_data = await temp_collector.collect_all()
-    cpu = None
-    for k, v in temps_data.items():
-        if "coretemp" in k and isinstance(v, dict):
-            vals = [x for x in v.values() if isinstance(x, (int, float))]
-            if vals:
-                cpu = round(max(vals), 1)
-    ssd = temps_data.get("hwmon_nvme", {}).get("temp1_input")
-    # HDD 温度: 优先用 temp_collector 汇总的多盘最高温(hdd键), 兜底 disk_sda
-    hdd = temps_data.get("hdd", {}).get("temperature")
-    if hdd is None:
-        hdd = temps_data.get("disk_sda", {}).get("temperature")
+    # v7 诊断: 入口就打毫秒级时间戳日志 (精确测量 "点按钮 → TX发出 → RX确认" 全链路耗时)
+    _t_run_start = time.time()
+    _stamp = lambda: datetime.fromtimestamp(time.time()).strftime("%H:%M:%S.") + f"{int((time.time()%1)*1000):03d}"
+    logger.info(f"[run_control] 入口 @ {_stamp()} (按钮点击/HTTP请求到达)")
+
+    # 1. 采集 NAS 温度 → 统一公共函数提取 CPU/SSD/HDD
+    temps_data = await collect_temps_cached()
+    cpu, ssd, hdd = _extract_temp_sensors(temps_data)
     td = {"cpu": cpu, "ssd": ssd, "hdd": hdd}
+    logger.info(f"[run_control] 温度采集完成 @ {_stamp()} → CPU={cpu} SSD={ssd} HDD={hdd} (距入口{round((time.time()-_t_run_start)*1000)}ms)")
 
     # 2. 计算目标转速
     target = fan_control.calc_target_speed(td["cpu"], td["ssd"], td["hdd"])
 
-    # 3. 设置风扇(两条命令用;组合,一次性发送)
-    combined = f"F1CPD={target};F2CPD={target}"
-    await controller.send_raw(combined)
-    # 读取设置后的转速验证
-    f1 = await controller.get_fan_speed(1)
-    f2 = await controller.get_fan_speed(2)
+    # 3. 设置风扇 - 只控制 F1 (系统只有一个风扇, F2 不存在, 不要下发避免浪费时间)
+    #    set_fan_speed 内部会从 F1CPD=xx 的确认回复解析, 直接更新 speed_cache
+    #    不需要额外发送 F1CPD? 查询命令 (这是之前版本的 BUG, 已修复)
+    t0 = time.time()
+    r1 = await controller.set_fan_speed(1, target)
+    t_cost = round(time.time() - t0, 2)
+    logger.info(f"[run_control] 温度CPU={cpu} SSD={ssd} HDD={hdd} → 目标{target}% "
+                f"→ F1结果={r1.get('ok')} 值={r1.get('value')}% 串口耗时{t_cost}s")
+    logger.info(f"[run_control] 全部完成 @ {_stamp()} → 距入口{round((time.time()-_t_run_start)*1000)}ms (包含温度采集+串口下发+确认解析+NTC读取)")
 
-    # 4. 读取 NTC
-    ntc = await controller.get_ntc_temp()
+    # 4. 读取 NTC (从缓存取最快, 如果缓存为空再尝试发一次 get_ntc_temp)
+    ntc_cached = controller.get_ntc_cached()
+    if ntc_cached.get("ok"):
+        ntc_val = ntc_cached.get("value")
+    else:
+        r_ntc = await controller.get_ntc_temp()
+        ntc_val = r_ntc.get("value") if r_ntc.get("ok") else None
 
     return {
         "ok": True,
         "temps": {"cpu": td["cpu"], "ssd": td["ssd"], "hdd": td["hdd"]},
         "target_speed": target,
-        "fan1": f1.get("value"),
-        "fan2": f2.get("value"),
-        "ntc": ntc.get("value"),
+        "fan1": r1.get("value") if r1.get("ok") else None,
+        "fan2": None,  # 系统只有 F1, F2 不存在
+        "ntc": ntc_val,
+        "cost_s": t_cost,
     }
 
 # ═══════════════ 辅助 ═══════════════
