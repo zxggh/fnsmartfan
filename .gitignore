@@ -40,6 +40,15 @@ desktop.ini
 # ========== 临时文件 ==========
 *.tmp
 *.temp
+# 本地 BASE64 解包/打包临时目录 (smartfan-install.sh 是唯一发布源, 解包副本不要提交)
+_extracted/
+_pack_tmp/
+_*.tar.gz
+_repack_*.py
+_fix_b64_*.py
+_extract_base.tmp.tar.gz
+_pack_output.tar.gz
+_verify.tar.gz
 # 本地临时解压工作区 & 补丁副本 (仓库以 smartfan-install.sh BASE64 为准)
 temp_work/
 修改后文件_*/

@@ -37,22 +37,44 @@ HISTORY_FILE = Path("/data/temp_history.jsonl")
 
 class TempHistory:
     def __init__(self):
-        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if not HISTORY_FILE.exists():
-            HISTORY_FILE.touch()
-            logger.info(f"温度历史文件创建: {HISTORY_FILE}")
-        else:
-            lines = sum(1 for _ in open(HISTORY_FILE, "r", encoding="utf-8"))
-            logger.info(f"温度历史文件已存在: {HISTORY_FILE} ({lines} 行记录)")
-        # 启动时先清理一次过期数据
-        self._cleanup_expired()
+        # ★ v6 加固: 任何 /data 卷权限问题都不要让整个服务崩溃,
+        #   降级为 "内存模式" — 仅在本次运行内存中保存历史数据,
+        #   容器重启会丢失, 但核心温控/实时曲线完全正常, 避免 PermissionError
+        #   导致的 FastAPI lifespan 直接抛出 → 容器狂重启.
+        self._memory_mode = False
+        self._in_memory_records = []   # 内存模式下暂存记录 (list[dict])
         self._last_cleanup_time = time.time()
+        try:
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            if not HISTORY_FILE.exists():
+                HISTORY_FILE.touch()
+                logger.info(f"温度历史文件创建: {HISTORY_FILE}")
+            else:
+                # 只读权限就先尝试读一行测试, 行数计算失败也不致命
+                try:
+                    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                        lines = sum(1 for _ in f)
+                    logger.info(f"温度历史文件已存在: {HISTORY_FILE} ({lines} 行记录)")
+                except Exception as le:
+                    logger.warning(f"读取历史文件行数失败(继续尝试写入模式): {le}")
+            # 启动时先清理一次过期数据
+            self._cleanup_expired()
+        except (PermissionError, OSError, IOError) as pe:
+            self._memory_mode = True
+            logger.error(
+                f"⚠️  温度历史持久化关闭(权限不足, 降级为内存模式): {pe}. "
+                f"本次运行内存中仍会保留采样数据, 但容器重启后会丢失. "
+                f"修复方法: 宿主机执行 chmod -R 777 /你的卷目录 或 容器以 root 用户启动."
+            )
+        except Exception as e:
+            self._memory_mode = True
+            logger.error(f"⚠️  温度历史初始化失败(降级为内存模式): {e}", exc_info=False)
 
     # ------------------ 写入 ------------------
     def add_record(self, cpu=None, ssd=None, hdd=None, ntc=None):
         """追加一条温度记录. 温度值为 None 时写 null(JSON 兼容).
 
-        注意: 调用方决定采样频率, 这里只负责写入(原子追加, 线程安全由调用方保证单协程).
+        ★ v6 加固: 内存模式就追加到内存 list, 不写文件; 任何写入异常都不抛出.
         """
         rec = {
             "t": int(time.time()),       # 秒级 UNIX 时间戳 (便于 JSON 传输)
@@ -61,6 +83,18 @@ class TempHistory:
             "hdd": hdd,
             "ntc": ntc,
         }
+        # ---- 内存模式: 直接 append, 同时按 7 天截断内存容量 ----
+        if self._memory_mode:
+            try:
+                self._in_memory_records.append(rec)
+                # 内存里最多保留 10080 条 (7 天 * 1440), 避免长周期运行占内存
+                if len(self._in_memory_records) > RETAIN_DAYS * 1440 + 100:
+                    self._in_memory_records[:] = self._in_memory_records[-(RETAIN_DAYS * 1440):]
+            except Exception as e:
+                logger.warning(f"温度历史内存写入失败: {e}")
+            return
+
+        # ---- 持久化模式: 追加写 JSONL ----
         try:
             line = json.dumps(rec, ensure_ascii=False) + "\n"
             # a+ 追加: 写入量极小(<100B/min), 不用 fsync 也 OK, NAS 掉电概率极低.
@@ -121,27 +155,41 @@ class TempHistory:
     def query_range_seconds(self, seconds_ago: int):
         """查询从 now-seconds_ago 到 now 的温度数据, 并按 MAX_POINTS 做降采样.
 
+        ★ v6 加固: 内存模式时从 self._in_memory_records 读取, 否则读 JSONL 文件.
         返回:
             list[dict] — 元素: {"t": int_ts, "cpu":float|None, "ssd":..., "hdd":..., "ntc":...}
                          已按 t 升序排列.
         """
         start_ts = time.time() - seconds_ago
         raw = []
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line: continue
-                    try:
-                        rec = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+
+        # ---- 内存模式: 遍历内存列表 ----
+        if self._memory_mode:
+            try:
+                for rec in self._in_memory_records:
                     ts = rec.get("t", 0)
                     if ts >= start_ts:
                         raw.append(rec)
-        except Exception as e:
-            logger.warning(f"历史查询失败: {e}")
-            return []
+            except Exception as e:
+                logger.warning(f"内存模式历史查询失败: {e}")
+                return []
+        # ---- 持久化模式: 读 JSONL ----
+        else:
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line: continue
+                        try:
+                            rec = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        ts = rec.get("t", 0)
+                        if ts >= start_ts:
+                            raw.append(rec)
+            except Exception as e:
+                logger.warning(f"历史查询失败: {e}")
+                return []
 
         if len(raw) <= MAX_POINTS:
             return raw  # 量少直接返回, 不降采样

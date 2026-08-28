@@ -107,7 +107,18 @@ async def lifespan(app: FastAPI):
     # 启动时加载持久化的开关状态
     auto_cmd_enabled = _load_auto_cmd_state()
     # v6 初始化温度历史持久化 (放在 /data 卷, 容器重启不丢, 启动时清理过期数据)
-    temp_history = TempHistory()
+    # ★ v6 加固: 任何初始化异常(最常见 PermissionError 卷权限)都不抛到 lifespan,
+    #   设为 None 降级 — 核心温控/实时温度完全正常, 仅历史曲线功能暂时不可用,
+    #   避免 FastAPI startup fail → 容器直接退出 → 无限重启.
+    try:
+        temp_history = TempHistory()
+    except Exception as e:
+        temp_history = None
+        logger.error(
+            f"⚠️  温度历史模块初始化失败(已停用历史功能, 服务继续启动): {e}. "
+            f"最常见原因: /data 卷无写入权限 — 请执行 chmod -R 777 /你的卷目录 "
+            f"或确保容器以 root 用户启动."
+        , exc_info=False)
     logger.info(f"自动命令发送开关: {'开启' if auto_cmd_enabled else '关闭'}")
     controller = STCController(**config["serial"])
     temp_collector = TempCollector()
