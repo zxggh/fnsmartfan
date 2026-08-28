@@ -111,8 +111,14 @@ RUN groupadd -r dialout 2>/dev/null || true \
 # ============================================================
 RUN echo "--- /app contents after build ---" && ls -la /app && echo "--- start.sh exists:" && cat /app/start.sh 2>/dev/null | head -50 || echo "start.sh missing"
 
-# 切换到普通用户
-USER fanuser
+# 切换到普通用户 — NAS 部署场景下默认关闭, 保持 root 启动
+# ★ v6 修复无限重启: 飞牛/群晖等 NAS 的 Docker 挂载卷默认所有者是 root(uid 0),
+#   如果用非 root 用户(fanuser uid 1000)启动, 写入 /data/config.yaml 或
+#   /data/temp_history.jsonl 会触发 PermissionError → FastAPI 启动失败 →
+#   容器退出 → 重启策略触发 → 无限重启循环.
+#   用户容器配置中已勾选「最高权限」(特权模式), 保持 root 启动是 NAS
+#   类环境的事实标准(同时能正确访问 /dev/ttyUSB* /dev/sd* 等设备).
+# USER fanuser
 
 # 暴露 Web 控制台端口
 EXPOSE 8780
@@ -121,22 +127,26 @@ EXPOSE 8780
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -s -m 3 http://127.0.0.1:8780/api/info >/dev/null 2>&1 || exit 1
 
-# 启动命令：
-# 1) 空卷初始化：把 /app/config.yaml 模板拷到 /data（如果卷里还没有）
-# 2) 将 /app/config.yaml 软链到 /data/config.yaml，保证配置在容器重建后保留
-# 3) 用 root 用户 + --privileged 已经足够访问串口，跳过 sg dialout/sg disk
-#    （原 start.sh 里的嵌套 sg 会在非 TTY 环境索要密码 → 容器死循环重启）
-# 4) 首次启动时补装项目 requirements (兼容老镜像/构建阶段漏装)
-#    同样用「官方 PyPI 为主 + 清华为辅」双源, 5 次重试, python -m pip
+# 启动命令(★ v6 防无限重启版: 详细日志 + 单步容错 + 启动失败 sleep 10s)
+#  为什么不用 set -e 也不用 &&?  — 任何一步失败都不会立刻退出容器,
+#  而是打印错误并继续到最后, 启动失败也 sleep 10 秒, 方便用户 docker logs 定位
+#  而不是 1 秒内反复重启导致根本看不到错误日志.
 CMD ["bash", "-c", "\
-set -e && \
-cd /app && \
+echo '[smartfan-init] ==== 容器启动, 开始初始化 ===='; \
+cd /app || (echo '[smartfan-init] ERROR: cd /app 失败' && sleep 10 && exit 1); \
+echo '[smartfan-init] 1/5 确保 /data 卷目录存在且可写'; \
+mkdir -p /data && chmod 777 /data 2>/dev/null || echo '[smartfan-init] WARN: chmod /data 失败(继续)'; \
+echo '[smartfan-init] 2/5 config.yaml 初始化(空卷复制模板, 软链到 /app)'; \
 if [ ! -f /data/config.yaml ] && [ -f /app/config.yaml ]; then \
-  mkdir -p /data && cp /app/config.yaml /data/config.yaml; \
-fi && \
-rm -f /app/config.yaml && ln -sf /data/config.yaml /app/config.yaml && \
+  cp /app/config.yaml /data/config.yaml && echo '[smartfan-init] OK: 模板 config.yaml 复制到卷' \
+  || echo '[smartfan-init] WARN: 复制 config.yaml 失败(继续使用默认配置)'; \
+fi; \
+if [ -f /data/config.yaml ]; then chmod 666 /data/config.yaml 2>/dev/null || true; fi; \
+rm -f /app/config.yaml 2>/dev/null || true; \
+ln -sf /data/config.yaml /app/config.yaml 2>/dev/null || echo '[smartfan-init] WARN: 软链 config.yaml 失败(继续)'; \
+echo '[smartfan-init] 3/5 确保 pip 可用 + 补装依赖(首次启动较慢, 请耐心等待)'; \
 /app/venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true; \
-/app/venv/bin/python -m pip install --quiet --no-cache-dir \
+/app/venv/bin/python -m pip install --progress-bar off --no-cache-dir \
   --retries 5 --timeout 60 \
   --index-url https://pypi.org/simple/ \
   --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
@@ -144,5 +154,12 @@ rm -f /app/config.yaml && ln -sf /data/config.yaml /app/config.yaml && \
   --trusted-host files.pythonhosted.org \
   --trusted-host pypi.tuna.tsinghua.edu.cn \
   -r /app/requirements.txt PyYAML pyserial pyserial-asyncio fastapi uvicorn schedule \
-  || true && \
-exec /app/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8780 --log-level info"]
+  >/tmp/pip.log 2>&1 && echo '[smartfan-init] OK: 依赖检查完成' \
+  || { echo '[smartfan-init] WARN: 依赖安装失败, 打印 pip.log 末尾 20 行:'; tail -20 /tmp/pip.log; }; \
+echo '[smartfan-init] 4/5 启动前检查 main.py 和 Python 环境'; \
+/app/venv/bin/python -c 'import fastapi, uvicorn, serial_asyncio, yaml, schedule; print(\"  deps ok: fastapi+\", fastapi.__version__, sep=\"\")' 2>/dev/null \
+  || echo '[smartfan-init] WARN: 依赖导入测试失败(可能影响功能, 继续尝试启动)'; \
+if [ ! -f /app/main.py ]; then echo '[smartfan-init] ERROR: /app/main.py 不存在! 打包/解压失败'; sleep 10; exit 2; fi; \
+echo '[smartfan-init] 5/5 启动 uvicorn (端口 8780), 日志如下:'; \
+exec /app/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8780 --log-level info \
+|| { echo '[smartfan-init] ERROR: uvicorn 启动异常退出, 10 秒后容器结束(方便查看错误)'; sleep 10; exit 3; }"]
