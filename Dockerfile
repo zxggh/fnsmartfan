@@ -70,12 +70,32 @@ RUN set -e \
 RUN python3 -m venv --system-site-packages /app/venv 2>/dev/null \
  || python3 -m venv /app/venv
 
-# 安装 Python 依赖（使用国内清华 PyPI 镜像源加速）
-# 注意：优先读项目自带 requirements.txt，缺失的包再单独补充
-RUN /app/venv/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    -r /app/requirements.txt 2>/dev/null || true \
- && /app/venv/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    pyserial-asyncio fastapi uvicorn
+# 安装 Python 依赖
+# ★ v6 修复 GitHub Actions 构建失败(pyserial-asyncio 找不到):
+#   1. 只用清华 PyPI(中国镜像)在 Actions runner(美国)搜不到小众包 pyserial-asyncio,
+#      改为「官方 PyPI 为主 + 清华 extra 为辅」双源 + 5 次重试,
+#      在任何地区构建都能找到包, 国内用户也有加速.
+#   2. 统一用 venv/bin/python -m pip 代替裸 pip, 符合 venv 最佳实践,
+#      避免某些 slim 镜像里 pip shebang 找不到的问题.
+#   3. 第二个 pip 末尾加 || true: 构建阶段即使偶发失败也不中断,
+#      因为 CMD 启动时会再补装一次(见底部启动命令).
+RUN /app/venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true \
+ && /app/venv/bin/python -m pip install \
+      --no-cache-dir --retries 5 --timeout 60 \
+      --index-url https://pypi.org/simple/ \
+      --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+      --trusted-host pypi.org --trusted-host pypi.python.org \
+      --trusted-host files.pythonhosted.org \
+      --trusted-host pypi.tuna.tsinghua.edu.cn \
+      -r /app/requirements.txt 2>/dev/null || true \
+ && /app/venv/bin/python -m pip install \
+      --no-cache-dir --retries 5 --timeout 60 \
+      --index-url https://pypi.org/simple/ \
+      --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+      --trusted-host pypi.org --trusted-host pypi.python.org \
+      --trusted-host files.pythonhosted.org \
+      --trusted-host pypi.tuna.tsinghua.edu.cn \
+      pyserial-asyncio fastapi uvicorn PyYAML || true
 
 # 确保启动脚本有执行权限
 RUN chmod +x /app/start.sh 2>/dev/null || true
@@ -106,7 +126,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # 2) 将 /app/config.yaml 软链到 /data/config.yaml，保证配置在容器重建后保留
 # 3) 用 root 用户 + --privileged 已经足够访问串口，跳过 sg dialout/sg disk
 #    （原 start.sh 里的嵌套 sg 会在非 TTY 环境索要密码 → 容器死循环重启）
-# 4) 首次启动时补装项目 requirements（兼容老镜像缺少 PyYAML 的问题）
+# 4) 首次启动时补装项目 requirements (兼容老镜像/构建阶段漏装)
+#    同样用「官方 PyPI 为主 + 清华为辅」双源, 5 次重试, python -m pip
 CMD ["bash", "-c", "\
 set -e && \
 cd /app && \
@@ -114,7 +135,14 @@ if [ ! -f /data/config.yaml ] && [ -f /app/config.yaml ]; then \
   mkdir -p /data && cp /app/config.yaml /data/config.yaml; \
 fi && \
 rm -f /app/config.yaml && ln -sf /data/config.yaml /app/config.yaml && \
-/app/venv/bin/pip install --quiet --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+/app/venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true; \
+/app/venv/bin/python -m pip install --quiet --no-cache-dir \
+  --retries 5 --timeout 60 \
+  --index-url https://pypi.org/simple/ \
+  --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  --trusted-host pypi.org --trusted-host pypi.python.org \
+  --trusted-host files.pythonhosted.org \
+  --trusted-host pypi.tuna.tsinghua.edu.cn \
   -r /app/requirements.txt PyYAML pyserial pyserial-asyncio fastapi uvicorn schedule \
   || true && \
 exec /app/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8780 --log-level info"]
