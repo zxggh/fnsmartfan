@@ -124,18 +124,42 @@ RUN echo "--- /app contents after build ---" && ls -la /app && echo "--- start.s
 EXPOSE 8780
 
 # 健康检查：通过 /api/info 接口判断服务状态
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# ★ v6 修复飞牛 GUI 误判「启动失败」坑:
+#   首次启动要 pip install 补装依赖约 30~60s, 之前 start-period=10s 太短,
+#   飞牛 GUI 会在前 30s 内看到不健康就直接判定失败.
+#   改为: start-period=90s + interval=20s + retries=5,
+#   给足首次启动补装依赖 + 预热时间, GUI 不会误判.
+HEALTHCHECK --interval=20s --timeout=5s --start-period=90s --retries=5 \
   CMD curl -s -m 3 http://127.0.0.1:8780/api/info >/dev/null 2>&1 || exit 1
 
-# 启动命令(★ v6 防无限重启版: 详细日志 + 单步容错 + 启动失败 sleep 10s)
-#  为什么不用 set -e 也不用 &&?  — 任何一步失败都不会立刻退出容器,
-#  而是打印错误并继续到最后, 启动失败也 sleep 10 秒, 方便用户 docker logs 定位
-#  而不是 1 秒内反复重启导致根本看不到错误日志.
+# 启动命令(★ v6 防无限重启版 + NAS 部署环境自检):
+#  1) 不用 set -e 也不用 && 链式: 任何一步失败都不立刻退出容器,
+#     而是打印错误并继续, 启动失败也 sleep 10 秒方便定位.
+#  2) 启动前做环境自检(UID / 串口设备 / 卷写权限), 不满足时
+#     打印中文 ERROR 级修复指引, 用户 docker logs 一眼能看到.
 CMD ["bash", "-c", "\
 echo '[smartfan-init] ==== 容器启动, 开始初始化 ===='; \
+echo '[smartfan-init] 环境自检:'; \
+uid=$(id -u); \
+echo \"  当前运行用户 UID: $uid\"; \
+if [ \"$uid\" != \"0\" ]; then \
+  echo '  ⚠️  WARNING: 非 root 用户启动! NAS 上访问串口/卷大概率失败, 请加 --user root 或在 GUI 创建容器时切换到 root 用户'; \
+fi; \
+tty_cnt=$(ls /dev/ttyUSB* /dev/ttyACM* /dev-host-dev/ttyUSB* /dev-host-dev/ttyACM* 2>/dev/null | wc -l); \
+echo \"  检测到的串口设备数: $tty_cnt\"; \
+if [ \"$tty_cnt\" -eq 0 ] && [ ! -d /dev/usbmon0 ] 2>/dev/null; then \
+  echo '  ⚠️  WARNING: 未检测到任何串口设备! 请确保启动时加 --privileged 并映射 /dev (推荐) 或逐个 --device /dev/ttyUSB0 等'; \
+fi; \
+mkdir -p /data 2>/dev/null; \
+if touch /data/.write_test 2>/dev/null; then \
+  echo '  /data 卷写入权限: ✓ OK'; \
+  rm -f /data/.write_test; \
+else \
+  echo '  ⚠️  WARNING: /data 卷无写入权限! 温度历史/配置持久化失效, 请执行: chmod -R 777 /你的卷路径'; \
+fi; \
 cd /app || (echo '[smartfan-init] ERROR: cd /app 失败' && sleep 10 && exit 1); \
 echo '[smartfan-init] 1/5 确保 /data 卷目录存在且可写'; \
-mkdir -p /data && chmod 777 /data 2>/dev/null || echo '[smartfan-init] WARN: chmod /data 失败(继续)'; \
+chmod 777 /data 2>/dev/null || echo '[smartfan-init] WARN: chmod /data 失败(继续)'; \
 echo '[smartfan-init] 2/5 config.yaml 初始化(空卷复制模板, 软链到 /app)'; \
 if [ ! -f /data/config.yaml ] && [ -f /app/config.yaml ]; then \
   cp /app/config.yaml /data/config.yaml && echo '[smartfan-init] OK: 模板 config.yaml 复制到卷' \
@@ -144,7 +168,7 @@ fi; \
 if [ -f /data/config.yaml ]; then chmod 666 /data/config.yaml 2>/dev/null || true; fi; \
 rm -f /app/config.yaml 2>/dev/null || true; \
 ln -sf /data/config.yaml /app/config.yaml 2>/dev/null || echo '[smartfan-init] WARN: 软链 config.yaml 失败(继续)'; \
-echo '[smartfan-init] 3/5 确保 pip 可用 + 补装依赖(首次启动较慢, 请耐心等待)'; \
+echo '[smartfan-init] 3/5 确保 pip 可用 + 补装依赖(首次启动较慢, 请耐心等待, 通常 30~60 秒)'; \
 /app/venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true; \
 /app/venv/bin/python -m pip install --progress-bar off --no-cache-dir \
   --retries 5 --timeout 60 \
@@ -160,6 +184,7 @@ echo '[smartfan-init] 4/5 启动前检查 main.py 和 Python 环境'; \
 /app/venv/bin/python -c 'import fastapi, uvicorn, serial_asyncio, yaml, schedule; print(\"  deps ok: fastapi+\", fastapi.__version__, sep=\"\")' 2>/dev/null \
   || echo '[smartfan-init] WARN: 依赖导入测试失败(可能影响功能, 继续尝试启动)'; \
 if [ ! -f /app/main.py ]; then echo '[smartfan-init] ERROR: /app/main.py 不存在! 打包/解压失败'; sleep 10; exit 2; fi; \
-echo '[smartfan-init] 5/5 启动 uvicorn (端口 8780), 日志如下:'; \
+echo '[smartfan-init] 5/5 启动 uvicorn (端口 8780), 服务日志如下:'; \
+echo '[smartfan-init] 提示: 飞牛 GUI 如果显示「启动失败」请不要删容器, 等 1~2 分钟刷新容器列表, 健康检查通过后自动变为运行中.'; \
 exec /app/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8780 --log-level info \
 || { echo '[smartfan-init] ERROR: uvicorn 启动异常退出, 10 秒后容器结束(方便查看错误)'; sleep 10; exit 3; }"]

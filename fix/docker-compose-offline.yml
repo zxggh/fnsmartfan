@@ -1,0 +1,52 @@
+# ============================================================
+# SmartFan 智能风扇控制器 — 飞牛 NAS docker compose 一键启动
+#
+# 使用方法 (SSH 登录飞牛 NAS 后执行, 必须 root):
+#   1) 把本文件放到任意目录 (例如 /vol1/1000/docker/smartfan-fix/)
+#   2) docker compose -f docker-compose-offline.yml up -d
+#   3) 等 1~2 分钟, 浏览器打开 http://NAS-IP:8780
+#
+# 特性:
+#   ✓ 所有参数齐全: root + privileged + /dev 映射 + 卷
+#   ✓ 健康检查 start-period=90s, 不会误判启动失败
+#   ✓ 日志 10M×5 限制, 不撑爆硬盘
+#   ✓ 容器重建自动创建 smartfan-data 卷, 配置持久化
+# ============================================================
+
+services:
+  smartfan:
+    image: zxggh/fnsmartfan:latest
+    container_name: smartfan
+    user: "root"                 # NAS 串口/卷必须 root
+    privileged: true             # 特权模式, 自动访问所有 /dev 设备
+    restart: always              # NAS 重启自动拉起
+    ports:
+      - "8780:8780"              # Web 控制台端口
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      # 持久化配置 + 温度历史 (容器重建不丢数据)
+      - smartfan-data:/data
+      # 映射整个 /dev 目录 (privileged 下控制器 USB 串口直接可用)
+      - /dev:/dev:rw
+    devices:
+      # 兜底: 即使没 privileged, 常用串口也直接映射 (都不存在也不报错)
+      - /dev/ttyUSB0:/dev/ttyUSB0
+      - /dev/ttyUSB1:/dev/ttyUSB1
+      - /dev/ttyACM0:/dev/ttyACM0
+      - /dev/ttyACM1:/dev/ttyACM1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-m", "3", "http://127.0.0.1:8780/api/info"]
+      interval: 20s
+      timeout: 5s
+      start_period: 90s        # 首次启动 pip install 约 30~60s
+      retries: 5
+
+volumes:
+  smartfan-data:
+    name: smartfan-data
