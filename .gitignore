@@ -46,6 +46,7 @@ _pack_tmp/
 _*.tar.gz
 _repack_*.py
 _fix_b64_*.py
+_extract.py
 _extract_base.tmp.tar.gz
 _pack_output.tar.gz
 _verify.tar.gz
