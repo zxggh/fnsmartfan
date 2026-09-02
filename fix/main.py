@@ -401,7 +401,7 @@ async def lifespan(app: FastAPI):
     if controller and controller._writer:
         await controller.disconnect()
 
-app = FastAPI(title="STC 智能风扇控制器", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="STC 智能风扇控制器", version="2.2.0", lifespan=lifespan)
 
 # ── 模型 ──
 class SpeedSet(BaseModel):
@@ -730,7 +730,7 @@ async def get_info():
             pass
     return {"ok": True, "data": {
         "service": "STC 智能风扇控制器",
-        "version": "2.1.0-v10",     # v10: 无物理设备时不触发REBOOT(避免1430次空转) + autosuspend禁用
+        "version": "2.2.0",     # v2.2.0: 修复fan-controller打包覆盖+SSD无NVMe显示空+CPU用i915 SoC温度
         "uptime": round(time.time() - start_time, 1),
         "controller_connected": c.connected if c else False,
         "controller_port": config["serial"]["port"],
