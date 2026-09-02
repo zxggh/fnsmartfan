@@ -130,6 +130,9 @@ class STCController:
         self._reconnect_total_attempts = 0           # ensure_connected 内累计重连次数
         self._consecutive_ping_fails_since_ok = 0    # 上次成功后累计 ping 失败次数 (含已断连期间)
         self._reboot_issued_count = 0                # 历史 REBOOT 总次数 (诊断用)
+        self._reboot_in_progress = False             # v9: 防重入(REBOOT 期间 ping 直接返回 False)
+        self._usb_reset_ok_count = 0                 # v9: 主机侧USB复位成功次数(诊断)
+        self._autosuspend_disabled = False           # v9: 是否已禁用 Linux USB autosuspend
         # 日志
         self.log = []
 
@@ -138,19 +141,160 @@ class STCController:
         if len(self.log) > 50:
             self.log.pop(0)
 
-    # ── v8 新增: 死锁恢复 — 主动发 REBOOT 让控制器硬复位 ──
-    async def _issue_reboot(self, reason: str):
-        """检测到死锁/心跳超时后, 发送 REBOOT 命令让控制器复位.
+    # ── v9 新增: 主机侧 USB 物理复位 — 不依赖固件合作 ──
+    async def _host_usb_reset(self):
+        """★v9: 主机侧 USB 设备复位 — 强制物理重枚举, 不依赖固件合作.
 
-        关键点:
-        1. REBOOT 是固件原生命令 (已在 _EARLY_CMD_RE 中列入支持), 复位后 USB 会短暂掉线重枚举
-        2. 死锁状态下发送可能失败 (bUsbInBusy=1 时 TX/RX 都不通), 所以:
-           - 先直接写底层 writer (跳过 send() 的 connected 检查), 连发 2 次
-           - 然后强制 disconnect, 等 5 秒让控制器完成重启 + USB 重新枚举
-           - 即使发送失败也必须 disconnect + 等待, 否则永远卡在旧死锁文件句柄上
-        3. 调用方 ensure_connected() 之后会继续循环扫端口, 就能自动连上复位后的新设备
+        bUsbInBusy 死锁的本质: 固件内部 USB IN 端点状态机卡死,
+        无论主机端怎么 close/open 串口都无效 (死锁在固件里, 不在主机端).
+        REBOOT 命令也可能发不进去 (TX 通路也可能被死锁影响).
+
+        唯一可靠解法: 主机侧强制 USB 设备物理断开+重连,
+        让 USB 控制器重新枚举设备, 固件 USB 状态机从头初始化.
+
+        三层尝试(任一成功即返回 True):
+        1. /sys authorized toggle (需 privileged 模式, 最可靠)
+           — 写 '0' 到 authorized 让 USB 设备物理断开, 等 2s, 写 '1' 重新枚举
+        2. fcntl USBDEVFS_RESET ioctl (需 /dev/bus/usb 访问权限)
+           — 对 USB 设备文件发 USBDEVFS_RESET ioctl, 软复位
+        3. subprocess usbreset 命令(如果系统已安装)
+        """
+        port_name = self._port.split('/')[-1]  # ttyACM0
+        logger.info(f"[USB复位] 尝试主机侧USB物理复位 {self._port} (不依赖固件)")
+
+        # ── 方法1: /sys authorized toggle (最可靠, 需 privileged) ──
+        # 原理: 写 '0' 让内核断开 USB 设备(等同于物理拔出), 写 '1' 重新枚举(等同于插入)
+        # 效果: 固件 USB 状态机被强制重新初始化, bUsbInBusy 死锁必定清除
+        try:
+            tty_sys = f'/sys/class/tty/{port_name}'
+            if os.path.isdir(tty_sys):
+                # 从 /sys/class/tty/ttyACM0/device 逐层向上找 authorized 文件
+                current = os.path.realpath(f'{tty_sys}/device')
+                for _ in range(10):  # 最多向上 10 层
+                    auth = os.path.join(current, 'authorized')
+                    if os.path.exists(auth):
+                        logger.info(f"[USB复位] 找到 authorized: {auth}")
+                        # deauthorize: USB 设备物理断开
+                        with open(auth, 'w') as f:
+                            f.write('0')
+                        logger.info("[USB复位] 已 deauthorize (USB 设备物理断开)")
+                        await asyncio.sleep(2)
+                        # reauthorize: USB 设备重新枚举, 驱动重新加载
+                        with open(auth, 'w') as f:
+                            f.write('1')
+                        logger.info("[USB复位] 已 reauthorize (USB 设备重新枚举)")
+                        await asyncio.sleep(3)  # 等待重枚举 + cdc_acm 驱动加载
+                        self._usb_reset_ok_count += 1
+                        logger.info("[USB复位] ✅ authorized toggle 成功")
+                        return True
+                    parent = os.path.dirname(current)
+                    if parent == current:
+                        break
+                    current = parent
+                logger.warning("[USB复位] /sys 路径下未找到 authorized 文件 (容器未用 privileged?)")
+        except Exception as e:
+            logger.warning(f"[USB复位] authorized toggle 异常: {type(e).__name__}: {e}")
+
+        # ── 方法2: fcntl USBDEVFS_RESET ioctl (软复位, 不需要断开设备) ──
+        # 对 /dev/bus/usb/<bus>/<dev> 发 USBDEVFS_RESET ioctl
+        try:
+            import fcntl
+            USBDEVFS_RESET = 21780  # _IO('U', 20)
+            tty_sys = f'/sys/class/tty/{port_name}'
+            if os.path.isdir(tty_sys):
+                current = os.path.realpath(f'{tty_sys}/device')
+                for _ in range(10):
+                    devnum_file = os.path.join(current, 'devnum')
+                    busnum_file = os.path.join(current, 'busnum')
+                    if os.path.exists(devnum_file) and os.path.exists(busnum_file):
+                        busnum = int(open(busnum_file).read().strip())
+                        devnum = int(open(devnum_file).read().strip())
+                        usb_dev_file = f'/dev/bus/usb/{busnum:03d}/{devnum:03d}'
+                        if os.path.exists(usb_dev_file):
+                            logger.info(f"[USB复位] 尝试 ioctl on {usb_dev_file}")
+                            fd = os.open(usb_dev_file, os.O_WRONLY)
+                            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+                            os.close(fd)
+                            logger.info(f"[USB复位] ✅ ioctl USBDEVFS_RESET 成功")
+                            await asyncio.sleep(3)
+                            self._usb_reset_ok_count += 1
+                            return True
+                    parent = os.path.dirname(current)
+                    if parent == current:
+                        break
+                    current = parent
+                logger.warning("[USB复位] 未找到 USB bus/dev 号")
+        except Exception as e:
+            logger.warning(f"[USB复位] ioctl 异常: {type(e).__name__}: {e}")
+
+        # ── 方法3: usbreset 命令(如果已安装) ──
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['usbreset', self._port],
+                capture_output=True, timeout=10
+            )
+            if result.returncode == 0:
+                logger.info("[USB复位] ✅ usbreset 命令成功")
+                await asyncio.sleep(3)
+                self._usb_reset_ok_count += 1
+                return True
+            else:
+                logger.warning(f"[USB复位] usbreset 返回非0: {result.stderr.decode()[:100]}")
+        except FileNotFoundError:
+            logger.info("[USB复位] usbreset 命令未安装(跳过)")
+        except Exception as e:
+            logger.warning(f"[USB复位] usbreset 异常: {type(e).__name__}: {e}")
+
+        logger.warning("[USB复位] ❌ 所有主机侧复位方法均失败 (容器可能未启用 privileged 模式?)")
+        return False
+
+    # ── v9: 禁用 Linux USB autosuspend (STC官方确认的根因之一) ──
+    async def _disable_autosuspend(self):
+        """禁用 Linux USB 自动挂起 — STC官方AI确认是 NAS 环境断连根因.
+
+        Linux 内核默认开启 USB autosuspend, 总线空闲时对 USB 设备发 SUSPEND 信号.
+        如果固件没正确处理 SUSIF/RSUIF 中断, 挂起后无法恢复 → 永久断连.
+        禁用后 USB 总线永不挂起, 消除诱因.
+        """
+        # 方法1: 全局禁用
+        try:
+            with open('/sys/module/usbcore/parameters/autosuspend', 'w') as f:
+                f.write('-1')
+            logger.info("[USB] 已禁用全局 USB autosuspend (autosuspend=-1)")
+        except Exception as e:
+            logger.warning(f"[USB] 禁用全局 autosuspend 失败(需 privileged): {type(e).__name__}")
+
+        # 方法2: 对所有已连接 USB 设备禁用 per-device autosuspend
+        try:
+            import glob
+            count = 0
+            for ctl in glob.glob('/sys/bus/usb/devices/*/power/control'):
+                try:
+                    with open(ctl, 'w') as f:
+                        f.write('on')
+                    count += 1
+                except Exception:
+                    pass
+            if count > 0:
+                logger.info(f"[USB] 已对 {count} 个 USB 设备禁用 per-device autosuspend")
+        except Exception as e:
+            logger.warning(f"[USB] per-device autosuspend 禁用失败: {type(e).__name__}")
+
+    # ── v8/v9: 死锁恢复 — REBOOT 命令 + 主机侧 USB 物理复位 ──
+    async def _issue_reboot(self, reason: str):
+        """检测到死锁/心跳超时后, 强制控制器复位.
+
+        ★v9 关键改进: 不再只依赖 REBOOT 命令(固件死锁时 TX 也断, 命令发不进去),
+           新增主机侧 USB 物理复位(不依赖固件合作):
+           Step 1: 尝试发 REBOOT 命令(固件 TX 通路可能还活着)
+           Step 2: 断开串口(释放文件句柄)
+           Step 3: ★主机侧 USB 设备复位(authorized toggle / ioctl / usbreset)
+                   — 即使 REBOOT 命令没发到固件, 物理重枚举也能清除 bUsbInBusy 死锁
+           Step 4: 等待 USB 重枚举完成, ensure_connected 后续循环自动连上新设备
         """
         self._reboot_issued_count += 1
+        self._reboot_in_progress = True   # v9: 防重入
         # ★ 先暂存计数再打印 (否则先清零再 log 永远显示 0/0, 诊断等于白打)
         _save_recon_attempts = self._reconnect_total_attempts
         _save_ping_fails = self._consecutive_ping_fails_since_ok
@@ -159,13 +303,13 @@ class STCController:
         logger.critical(
             f"[心跳超时复位#{self._reboot_issued_count}] 触发原因={reason} | "
             f"重连累计={_save_recon_attempts} | ping连续失败={_save_ping_fails} | "
-            f"准备发送 REBOOT 命令 + 强制断开等待 USB 重枚举..."
+            f"准备: REBOOT命令 + 断开 + ★主机侧USB物理复位..."
         )
         self._dump_state(f"REBOOT#{self._reboot_issued_count}_{reason}")
         self._log("SYS", f"[死锁恢复] 触发 REBOOT: {reason}")
 
+        # ── Step 1: 尝试发 REBOOT 命令 (固件 TX 通路可能还活着, 只有 RX 死锁) ──
         reboot_sent_ok = False
-        # 连发 2 次 REBOOT (死锁时第一次可能被卡住, 多发不坏事)
         for i in range(2):
             try:
                 if self._writer:
@@ -179,13 +323,33 @@ class STCController:
             except Exception as e:
                 logger.warning(f"[REBOOT] 第{i+1}次发送异常(死锁状态属正常): {type(e).__name__}: {e}")
         if not reboot_sent_ok:
-            logger.warning("[REBOOT] 命令 2 次都没发出去(典型 bUsbInBusy=1 死锁), 只能靠 断开+等待 USB 自行恢复")
+            logger.warning("[REBOOT] 命令未发出(典型bUsbInBusy死锁,TX也断了) → 转主机侧USB复位")
 
-        # 强制断开, 给控制器 5 秒完成硬件复位 + USB 重新枚举
-        #   (STC8H 软复位到 USB CDC 重新被宿主机识别, 实测 2~4 秒)
+        # ── Step 2: 断开串口 (释放文件句柄, 为 USB 重枚举做准备) ──
         await self.disconnect()
-        await asyncio.sleep(5)
-        logger.info(f"[REBOOT#{self._reboot_issued_count}] 完成, 进入后续重连流程")
+
+        # ── Step 3: ★v9 核心 — 主机侧 USB 物理复位 (不依赖固件!) ──
+        #   即使 REBOOT 命令因 TX 死锁没发到固件,
+        #   主机侧 authorized toggle / ioctl 能强制 USB 设备物理断开+重枚举,
+        #   固件 USB 状态机从头初始化, bUsbInBusy 死锁必定清除
+        usb_reset_ok = await self._host_usb_reset()
+
+        # ── Step 4: 等待设备重新枚举 ──
+        if not usb_reset_ok:
+            # USB 复位失败/不可用, 兜底等 5 秒(可能固件自己收到 REBOOT 也会复位)
+            logger.warning("[REBOOT] 主机侧USB复位失败/不可用, 等待5秒后继续重试(靠REBOOT命令或固件自身超时)")
+            await asyncio.sleep(5)
+        else:
+            # USB 复位成功, _host_usb_reset 内部已 sleep(3~5s), 再额外等 2s 确保驱动加载
+            await asyncio.sleep(2)
+
+        self._reboot_in_progress = False
+        logger.info(
+            f"[REBOOT#{self._reboot_issued_count}] 完成 | "
+            f"REBOOT命令={'已发' if reboot_sent_ok else '未发'} | "
+            f"主机USB复位={'成功' if usb_reset_ok else '失败'} | "
+            f"进入后续重连流程..."
+        )
 
     # ── 诊断辅助: dump 当前现场状态到 logger(docker logs 可见) ──
     def _dump_state(self, tag):
@@ -204,6 +368,7 @@ class STCController:
                 f"NTC缓存={self.ntc_cache}({ntc_age}) | "
                 # v8: 死锁/复位诊断计数 (最关键的排障字段)
                 f"REBOOT累计触发={self._reboot_issued_count}次 | "
+                f"USB复位成功={getattr(self, '_usb_reset_ok_count', 0)}次 | "
                 f"重连尝试累计={self._reconnect_total_attempts} | "
                 f"ping连续失败={self._consecutive_ping_fails_since_ok} | "
                 f"ttyACM*={acm_ports or '空'} | ttyUSB*={usb_ports or '空'} | "
@@ -229,10 +394,28 @@ class STCController:
         self._ping_fail_streak = 0
         # v8: 连接建立时重置失败计数 (但不重置 _reboot_issued_count 累计诊断数)
         self._consecutive_ping_fails_since_ok = 0
+        # v9: 连接后发 LED=ON (给固件一个"主机已连接"视觉信号)
+        #   即使 USB 刚连上可能还没完全就绪, 发了不坏事; 固件收不到就靠自己的超时逻辑
+        if self._writer:
+            try:
+                self._writer.write(b"LED=ON\r\n")
+                await asyncio.wait_for(self._writer.drain(), timeout=0.3)
+                self._log("TX", "LED=ON(连接指示)")
+            except Exception:
+                pass
 
     async def disconnect(self):
         self._connected = False
         r, w = self._reader, self._writer
+        # v9: 断开前尝试发 LED=OFF (给固件一个"主机侧断开"信号)
+        #   如果 USB 已死锁这步会失败, 但固件自己的命令超时会处理
+        if w:
+            try:
+                w.write(b"LED=OFF\r\n")
+                await asyncio.wait_for(w.drain(), timeout=0.3)
+                self._log("TX", "LED=OFF(断开指示)")
+            except Exception:
+                pass
         self._reader = None
         self._writer = None
         if w:
@@ -265,6 +448,11 @@ class STCController:
             死锁 (bUsbInBusy=1) 下, 串口能正常 open/close, 但永远收不到 ping 响应
             → 12 次 (≈低频 6 分钟) 仍失败 → 发 REBOOT 命令强制控制器复位
         """
+        # v9: 首次进入重连流程时, 禁用 Linux USB autosuspend (只需一次)
+        if not getattr(self, '_autosuspend_disabled', False):
+            await self._disable_autosuspend()
+            self._autosuspend_disabled = True
+
         if self._connected:
             try:
                 if await self.ping():
@@ -321,6 +509,10 @@ class STCController:
                 for p in range(3):
                     if p > 0:
                         await asyncio.sleep(0.8)   # 仅第 2/3 次前等 0.8s
+                    # ★ v9 修复: _issue_reboot 内部 disconnect 后 writer 变 None,
+                    #   不再浪费 2 次空转 ping, 直接跳出 for 循环进入下一轮重连
+                    if not self._writer:
+                        break
                     if await self.ping():
                         self._connected = True
                         self._last_ping_ok_time = time.time()
@@ -336,14 +528,18 @@ class STCController:
                 await self.disconnect()
 
             if not tested:
-                # 无可用端口时不刷屏, 每 10 次记一条
+                # ★v10修复: 无物理设备(USB断开)时, 不触发REBOOT(不是死锁, 是物理断开)
+                #   重置死锁计数器, 只等设备重新出现, 避免空转1430次REBOOT无用功
+                self._reconnect_total_attempts = 0
                 if attempt % 10 == 1:
                     self._dump_state(f"无可用端口#{attempt}")
-                    logger.info(f"重连中: 无可用端口, 尝试{attempt}次 耗时{elapsed:.0f}s")
+                    logger.info(f"等待USB设备重新出现(物理断开), 尝试{attempt}次 耗时{elapsed:.0f}s")
+                # 无设备时快速轮询(3s), 尽快捕捉重连窗口
+                await asyncio.sleep(3)
+                continue
 
             # ★ v8 修复 B: 死锁检测 A 路径 — 重连累计超阈值 → 强制 REBOOT
-            #   判定: 高频/低频累计次数超 _DEADLOCK_REBOOT_AFTER_RECONNECT 次仍没连上
-            #   (12 次 ≈ 高频 60s + 低频 6 分钟 = 约 7 分钟触发, 不会太急躁也不会等死)
+            #   仅在端口存在但ping无响应时才计数(真正的bUsbInBusy死锁场景)
             if self._reconnect_total_attempts >= self._DEADLOCK_REBOOT_AFTER_RECONNECT:
                 await self._issue_reboot(
                     f"重连累计{self._reconnect_total_attempts}次无响应(疑似bUsbInBusy死锁)"
@@ -371,7 +567,11 @@ class STCController:
         - 成功(收到响应且能解析出 NTC 或响应长度合理): _ping_fail_streak=0, _connected=True
         - 失败(无响应/异常): _ping_fail_streak+=1, 连续 2 次才置 _connected=False
         - v8 新增: 连续失败累计 + 阈值触发 REBOOT (防 bUsbInBusy=1 死锁)
+        - v9 新增: _reboot_in_progress 时直接返回 False (不空转, 不累计计数)
         """
+        # v9: REBOOT 期间不空转 ping (writer 已断, 等重枚举)
+        if self._reboot_in_progress:
+            return False
         if not self._writer:
             self._ping_fail_streak += 1
             self._consecutive_ping_fails_since_ok += 1

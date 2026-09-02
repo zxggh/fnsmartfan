@@ -724,6 +724,7 @@ async def get_info():
         try:
             extra = {
                 "reboot_count": getattr(c, "_reboot_issued_count", 0),
+                "usb_reset_count": getattr(c, "_usb_reset_ok_count", 0),
                 "reconnect_attempts": getattr(c, "_reconnect_total_attempts", 0),
                 "ping_fail_streak": getattr(c, "_consecutive_ping_fails_since_ok", 0),
             }
@@ -731,7 +732,7 @@ async def get_info():
             pass
     return {"ok": True, "data": {
         "service": "STC 智能风扇控制器",
-        "version": "2.1.0-v8",      # v8: 心跳超时复位 + NTC 历史修复
+        "version": "2.1.0-v10",     # v10: 无物理设备时不触发REBOOT(避免1430次空转) + autosuspend禁用
         "uptime": round(time.time() - start_time, 1),
         "controller_connected": c.connected if c else False,
         "controller_port": config["serial"]["port"],
