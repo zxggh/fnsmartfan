@@ -129,13 +129,18 @@ def _extract_temp_sensors(td: dict) -> Tuple[Optional[float], Optional[float], O
     / history_collector / GET /api/temps 里重复了 6 遍相同的核心提取逻辑,
     极易出现 copy-paste 不一致 BUG. 现在统一走这个函数.
     """
-    # CPU: 找 coretemp 键下的所有数值, 取最高
+    # CPU: 优先取 i915(SoC温度, 与飞牛NAS系统显示一致), 无则取 coretemp Package
     cpu: Optional[float] = None
-    for k, v in td.items():
-        if "coretemp" in k and isinstance(v, dict):
-            vals = [x for x in v.values() if isinstance(x, (int, float))]
-            if vals:
-                cpu = round(float(max(vals)), 1)
+    # 飞牛NAS系统显示的是 i915(Intel集显/SoC)温度, 比coretemp低~2°C
+    i915 = td.get("hwmon_i915", {}).get("temp1_input")
+    if isinstance(i915, (int, float)) and not isinstance(i915, bool):
+        cpu = round(float(i915), 1)
+    if cpu is None:
+        for k, v in td.items():
+            if "coretemp" in k and isinstance(v, dict):
+                vals = [x for x in v.values() if isinstance(x, (int, float))]
+                if vals:
+                    cpu = round(float(max(vals)), 1)
                 break
     # SSD: hwmon_nvme.temp1_input
     ssd = td.get("hwmon_nvme", {}).get("temp1_input")
