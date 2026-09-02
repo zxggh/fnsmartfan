@@ -142,18 +142,11 @@ def _extract_temp_sensors(td: dict) -> Tuple[Optional[float], Optional[float], O
                 if vals:
                     cpu = round(float(max(vals)), 1)
                 break
-    # SSD: hwmon_nvme.temp1_input
+    # SSD: 仅取 hwmon_nvme (NVMe SSD), 无NVMe则为None
+    # 不兜底其他hwmon设备(避免把网卡/GPU温度误当SSD温度)
     ssd = td.get("hwmon_nvme", {}).get("temp1_input")
     if not isinstance(ssd, (int, float)) or isinstance(ssd, bool):
-        # 兼容某些 hwmon0/hwmon1 路径 (nvme不一定挂在hwmon_nvme)
-        for k, v in td.items():
-            if isinstance(k, str) and k.startswith("hwmon_") and isinstance(v, dict):
-                candidate = v.get("temp1_input")
-                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
-                    ssd = candidate
-                    break
-            else:
-                continue
+        ssd = None
     # HDD: 优先 hdd.temperature (多盘已取max), 兜底 disk_sda.temperature
     hdd = None
     if isinstance(td.get("hdd"), dict):
