@@ -586,29 +586,6 @@ async function resetControl() {
   } catch(e) { console.error(e); }
 }
 
-// ── LED 开关(等待响应后变色) ──
-let ledState = false;
-async function toggleLed() {
-  const btn = document.getElementById("led-btn");
-  btn.disabled = true;
-  const cmd = ledState ? "OFF" : "ON";
-  try {
-    const r = await fetch(`${API}/api/led`, {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({cmd}),
-    }).then(r => r.json());
-    if (r.ok) {
-      ledState = cmd === "ON";
-    } else {
-      throw new Error(r.error || "无响应");
-    }
-  } catch(e) {
-    console.error(e);
-  }
-  updateLedBtn();
-  btn.disabled = false;
-}
-
 // ── 原始命令 ──
 async function sendRaw() {
   const input = document.getElementById("raw-cmd");
@@ -624,22 +601,12 @@ async function sendRaw() {
     pre.textContent = `> ${cmd}\n\n${r.response || "(空)"}`;
     if (r.ok) {
       const upper = cmd.toUpperCase();
-      if (upper.includes("CPD=") || upper.includes("LED=") || upper.includes("ALL")
+      if (upper.includes("CPD=") || upper.includes("ALL")
           || upper.startsWith("F1") || upper.startsWith("F2")) {
         await refreshFansNow();
-        if (upper.includes("LED=ON")) { ledState = true; updateLedBtn(); }
-        if (upper.includes("LED=OFF")) { ledState = false; updateLedBtn(); }
       }
     }
   } catch(e) { pre.textContent = `> ${cmd}\n\n❌ ${e.message}`; }
-}
-
-// 同步 LED 按钮显示
-function updateLedBtn() {
-  const btn = document.getElementById("led-btn");
-  if (!btn) return;
-  btn.textContent = ledState ? "💡 LED 开" : "💡 LED 关";
-  btn.className = "btn btn-led" + (ledState ? " on" : "");
 }
 
 // ── 调试日志 ──
@@ -658,13 +625,13 @@ async function refreshLog() {
 }
 setInterval(refreshLog, 5000);
 
-// ── 断连记录卡片 ──
-function toggleDiscCard() {
-  const card = document.getElementById("disc-card");
+// ── 通用可折叠卡片(断连记录 / 调试日志) ──
+function toggleCard(cardId) {
+  const card = document.getElementById(cardId);
   if (!card) return;
   card.classList.toggle("collapsed");
-  const btn = card.querySelector(".card-header .btn");
-  if (btn) btn.textContent = card.classList.contains("collapsed") ? "展开" : "折叠";
+  const collapsed = card.classList.contains("collapsed");
+  card.querySelectorAll("[data-fold-btn]").forEach(b => b.textContent = collapsed ? "展开" : "折叠");
 }
 
 async function refreshDiscLog() {

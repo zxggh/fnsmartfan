@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>智能风扇控制器</title>
-<link rel="stylesheet" href="/static/style.css?v=4">
+<link rel="stylesheet" href="/static/style.css?v=5">
 </head>
 <body>
 <header>
@@ -66,18 +66,6 @@
         </div>
       </div>
     </div>
-
-    <div class="card disc-card" id="disc-card">
-      <div class="card-header">
-        <span>🔌 断连记录</span>
-        <span id="disc-status" class="disc-status">--</span>
-        <span id="disc-arrow" class="disc-arrow">▼</span>
-        <button class="btn btn-sm" onclick="event.stopPropagation();toggleDiscCard()" style="margin-left:auto">折叠</button>
-      </div>
-      <div class="card-body disc-body-wrap" id="disc-body">
-        <div class="disc-empty">暂无断连记录</div>
-      </div>
-    </div>
   </section>
 
   <!-- 右栏: 控制面板 -->
@@ -107,13 +95,6 @@
     </div>
 
     <div class="card">
-      <div class="card-header">💡 LED 控制</div>
-      <div class="card-body">
-        <button class="btn btn-led" id="led-btn" onclick="toggleLed()">💡 LED 关</button>
-      </div>
-    </div>
-
-    <div class="card">
       <div class="card-header">
         <span>🖥️ 原始命令</span>
         <div class="auto-cmd-switch">
@@ -134,19 +115,31 @@
       </div>
     </div>
 
-    <div class="card">
-      <div class="card-header">
+    <div class="card collapsible collapsed" id="debug-card">
+      <div class="card-header" onclick="toggleCard('debug-card')">
         <span>🔍 调试日志</span>
-        <button class="btn btn-sm" onclick="refreshLog()">⟳ 刷新</button>
+        <button class="btn btn-sm" onclick="event.stopPropagation();refreshLog()">⟳ 刷新</button>
+        <button class="btn btn-sm" data-fold-btn onclick="event.stopPropagation();toggleCard('debug-card')" style="margin-left:auto">展开</button>
       </div>
       <div class="card-body">
         <pre id="debug-log" class="raw-response" style="max-height:300px;font-size:11px;color:var(--text)">加载中...</pre>
+      </div>
+    </div>
+
+    <div class="card disc-card collapsible collapsed" id="disc-card">
+      <div class="card-header" onclick="toggleCard('disc-card')">
+        <span>🔌 断连记录</span>
+        <span id="disc-status" class="disc-status">--</span>
+        <button class="btn btn-sm" data-fold-btn onclick="event.stopPropagation();toggleCard('disc-card')" style="margin-left:auto">展开</button>
+      </div>
+      <div class="card-body disc-body-wrap" id="disc-body">
+        <div class="disc-empty">暂无断连记录</div>
       </div>
     </div>
   </section>
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<script src="/static/app.js?v=4"></script>
+<script src="/static/app.js?v=5"></script>
 </body>
 </html>

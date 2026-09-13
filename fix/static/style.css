@@ -335,6 +335,12 @@ main {
 .disc-entry.disconnected .disc-time { color: var(--danger); }
 .disc-empty { text-align: center; color: var(--text-muted); padding: 12px; font-size: 11px; }
 
+/* 通用可折叠卡片(断连记录 / 调试日志等) */
+.card.collapsible .card-header { cursor: pointer; user-select: none; }
+.card.collapsible.collapsed .card-body { display: none; }
+.card.collapsible .collapsible-arrow { font-size: 10px; color: var(--text-muted); transition: transform 0.2s; margin-left: 8px; }
+.card.collapsible.collapsed .collapsible-arrow { transform: rotate(-90deg); }
+
 /* 滚动条 */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
