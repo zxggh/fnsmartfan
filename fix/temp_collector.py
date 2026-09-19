@@ -350,26 +350,36 @@ class TempCollector:
                 if 0 < val < 150:
                     return float(val)
             return None
-        # SATA HDD/SSD: 找 Temperature_Celsius 行
+        # SATA HDD/SSD: 找温度属性行 (兼容多种命名)
+        # 已知温度属性名:
+        #   Temperature_Celsius (ID 194)  — 大多数 HDD/SSD
+        #   Airflow_Temperature_Cel (ID 190) — 日立/部分老 HDD
+        #   Temperature_Internal (ID 231) — 部分 SSD
+        #   Temperature_Case (ID 233) — 部分 SSD
+        temp_line = None
         for line in text.split("\n"):
-            if "Temperature_Celsius" in line:
-                parts = line.split()
-                # smartctl 输出固定格式: ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
-                # 第 10 列 (索引 9) 是 RAW_VALUE, HDD 可能是 "36 (Min/Max 20/50)", SSD 是 "42"
-                if len(parts) >= 10:
-                    raw_val = parts[9]
-                    # 模拟 tr -cd '0-9': 只保留数字
-                    digits = re.sub(r"[^0-9]", "", raw_val)
-                    if digits:
-                        val = int(digits)
-                        if 0 < val < 150:
-                            return float(val)
-                # 兜底: 正则抓行内最后一个数字
-                nums = re.findall(r"\d+", line)
-                if nums:
-                    val = int(nums[-1])
+            # 匹配所有包含 Temp 的属性行 (不区分大小写)
+            if re.search(r'Temp', line, re.IGNORECASE):
+                temp_line = line
+                break
+        if temp_line:
+            parts = temp_line.split()
+            # smartctl 输出固定格式: ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
+            # 第 10 列 (索引 9) 是 RAW_VALUE, HDD 可能是 "36 (Min/Max 20/50)", SSD 是 "42"
+            if len(parts) >= 10:
+                raw_val = parts[9]
+                # 模拟 tr -cd '0-9': 只保留数字
+                digits = re.sub(r"[^0-9]", "", raw_val)
+                if digits:
+                    val = int(digits)
                     if 0 < val < 150:
                         return float(val)
+            # 兜底: 正则抓行内最后一个数字
+            nums = re.findall(r"\d+", temp_line)
+            if nums:
+                val = int(nums[-1])
+                if 0 < val < 150:
+                    return float(val)
         return None
 
     # ============================================================
