@@ -39,7 +39,7 @@ NTC_MIN, NTC_MAX = -20.0, 80.0
 # - (?!\d) 负向断言: NTC 后面不能紧跟数字, 排除 "NTC1:" / "NTC2:" 这种带编号的字段
 # - 支持中英文冒号或空格分隔
 # - 匹配示例: "NTC:26.8" / "NTC: 26.8°C" / "NTC 26.8" / "当前NTC：26.8"
-NTC_RE = re.compile(r"NTC(?!\d)\s*[:：]?\s*([+-]?\d+\.?\d*)")
+NTC_RE = re.compile(r"(?:NTC(?!\d)|AMB_TEMP)\s*[:：]?\s*([+-]?\d+\.?\d*)")
 
 # ── v7 新增: 命令"响应完整性"判断 + 命令分类
 #   发送命令后, 控制器通常在 50~150ms 内回复确认 (单行 \r\n 结尾),
@@ -52,11 +52,11 @@ NTC_RE = re.compile(r"NTC(?!\d)\s*[:：]?\s*([+-]?\d+\.?\d*)")
 #   GETNTC?  → 回复: NTC: 26.5°C   或  NOCONNECT
 #   F1CPD?   → 回复: 当前转速 : 30%  或  F1_CPD=30%
 _RESP_END_OK_FAIL = re.compile(r"(^|\r?\n|\s)(OK|FAIL|NOCONNECT|PONG)(\r?\n|$)", re.I)
-_RESP_FAN_CONFIRM = re.compile(r"F\d_CPD\s*=\s*\d+%?|当前转速\s*[:：]\s*\d+%", re.I)
-_RESP_NTC = re.compile(r"NTC\s*[:：]?\s*[+-]?\d+\.?\d*|NOCONNECT", re.I)
+_RESP_FAN_CONFIRM = re.compile(r"F\d(?:_CPD|_CUR_DUTY)\s*=\s*\d+%?|当前转速\s*[:：]\s*\d+%", re.I)
+_RESP_NTC = re.compile(r"(?:NTC(?!\d)|AMB_TEMP)\s*[:：]?\s*[+-]?\d+\.?\d*|NOCONNECT", re.I)
 # 哪些命令支持 "提前返回" (ping / set / query 这种 "一问一答短响应" 的)
 _EARLY_CMD_RE = re.compile(
-    r"^(PING|F\dCPD[=?]|LED|GETNTC\?|VERSION\?|REBOOT)", re.I
+    r"^(PING|F\d(?:CPD|_CUR_DUTY)[=?]|LED|GETNTC\?|AMB_TMP\?|VERSION\?|REBOOT)", re.I
 )
 
 
@@ -140,6 +140,12 @@ class STCController:
         self.log.append({"t": time.time(), "dir": d, "data": data[:200]})
         if len(self.log) > 50:
             self.log.pop(0)
+
+    def drain_logs(self):
+        """取出并清空日志缓冲, 返回日志列表 (供 WebSocket 推送)."""
+        logs = self.log
+        self.log = []
+        return logs
 
     # ── v9 新增: 主机侧 USB 物理复位 — 不依赖固件合作 ──
     async def _host_usb_reset(self):
@@ -795,16 +801,20 @@ class STCController:
 
         v7优化: 1秒无回复重发, 最多2次, 全部无反应则返回失败(不更新缓存).
         原参数(2秒/3次)累计耗时过长, 温控响应慢.
+        v3.0: 改用新命令名 F1_CUR_DUTY=XX, 兼容旧名 F1CPD=XX.
+              响应格式: F1_CUR_DUTY=30% (旧固件回 F1_CPD=30%, 正则都兼容).
         """
         speed = max(0, min(100, speed))
         for attempt in range(2):
-            resp = await self.send(f"F{fan}CPD={speed}", wait=1.0)
+            # 发送新命令名 F1_CUR_DUTY=XX (旧固件兼容 F1CPD=XX)
+            resp = await self.send(f"F{fan}_CUR_DUTY={speed}", wait=1.0)
             val = None
-            m = re.search(rf"F{fan}_CPD=(\d+)%?", resp)
+            # 兼容新旧响应格式: F1_CUR_DUTY=30% 或 F1_CPD=30% 或 当前转速:30%
+            m = re.search(rf"F{fan}(?:_CPD|_CUR_DUTY)=(\d+)%?", resp)
             if m:
                 val = int(m.group(1))
             else:
-                m2 = re.search(r"当前转速\s*:\s*(\d+)%", resp)
+                m2 = re.search(r"当前转速\s*[:：]\s*(\d+)%", resp)
                 if m2:
                     val = int(m2.group(1))
             if val is not None:

@@ -1,677 +1,510 @@
 /**
- * STC 智能风扇控制器 v6 — 前端(历史曲线大改版)
+ * SmartFan Nexus 前端主逻辑
  *
- * 改进点:
- *   1. 执行按钮: 乐观更新立即UI响应 (v5 已有)
- *   2. 曲线图: 4条曲线 (CPU/SSD/HDD/环境NTC), 系统识别几种显示几种 (v5 已有)
- *   3. ★ v6 核心: 后端持久化 + 前端范围选择器
- *        - 后端 1 分钟采样写入 JSONL 到 /data (容器卷, 7 天保留)
- *        - 前端下拉选 1h / 6h / 24h / 3d / 7d, 调 /api/temps/history 一次性拉整段历史
- *        - 返回点数 > 360 时后端自动均值降采样, 画图不卡
- *        - 只有短范围(≤6小时)时才在 poll 时追加实时点, 保持实时感
- *   4. 静态文件版本号: ?v=4, 强制浏览器刷新缓存
+ * 功能:
+ *   - 登录认证 (JWT, 记住我 localStorage / sessionStorage)
+ *   - WebSocket 实时推送 (状态 + 通信日志)
+ *   - ECharts 温度趋势图 (1h/24h/3d/7d/30d)
+ *   - 风扇自动/手动模式切换 (手动滑块 300ms 防抖)
+ *   - 磁盘明细展开面板
+ *   - 温度颜色分级 (<45 绿, 45-55 橙, >=55 红)
+ *   - PC 双栏 / 移动底部导航 响应式
  */
+
 const API = "";
-const POLL = 500; // v7优化: 从1500ms再缩到500ms, 风扇转速确认轮询更及时
-                 // 温度采集/auto_control 是 3s 周期, 风扇POLL 500ms不会增加任何NAS负载
-                 // (仅是读controller.speed_cache内存变量, 不发串口命令, <1ms)
+let token = null;
+let ws = null;
 let chart = null;
+let sliderDebounceTimer = null;
 
-// ── 全局缓存 ──
-// 最近一次 NTC 温度值(供 updateTemps 写入图表第4条曲线用)
-let lastNtcValue = null;
-// 每种数据源连续"无有效数据"计数, 用于短范围 append 模式下的动态隐藏
-let dataMissingCount = { cpu:0, ssd:0, hdd:0, ntc:0 };
-const DATASET_KEYS = ["cpu", "ssd", "hdd", "ntc"];
-// 兜底最多点数 (appendEnabled=true 但还没 loadHistory 完成时用)
-const CHART_MAX_POINTS = 480;
-
-// ── v6 新增: 历史曲线状态 ──
-const state = {
-  currentRange: "24h",           // 当前选择的范围
-  ranges: [],                    // 后端返回的 ranges 选项(备用)
-  appendEnabled: false,          // ≤6小时: poll 时继续追加实时点  >6小时: 只看历史快照
-  historyLabelsCount: 60,        // loadHistory 返回的 points 数, append 时按这个裁剪
-  historyLoaded: false,          // 首次 loadHistory 是否完成
-};
-
-document.addEventListener("DOMContentLoaded", () => {
-  initChart();
-  setTimeout(loadConfig, 500);
-  setTimeout(loadAutoCmd, 600);
-  // v6: 图表初始化完成后再加载历史曲线 (给后端1.5s启动时间, 避免首帧接口报错)
-  setTimeout(() => loadHistory(state.currentRange), 1500);
-  poll();
-  setInterval(poll, POLL);
-  // v6: 绑定时间范围下拉框 change 事件
-  const sel = document.getElementById("range-select");
-  if (sel) {
-    sel.addEventListener("change", (e) => {
-      loadHistory(e.target.value);
-    });
-  }
-});
-
-// ── 自动命令发送开关 ──
-let autoCmdEnabled = true;
-
-async function loadAutoCmd() {
-  try {
-    const r = await fetch(`${API}/api/auto-cmd`).then(r => r.json());
-    if (r.ok) updateAutoCmdUI(r.enabled);
-  } catch(e) { console.error("加载自动命令开关失败:", e); }
+// ============================================================
+//  认证相关
+// ============================================================
+function getToken() {
+  return localStorage.getItem("sf_token") || sessionStorage.getItem("sf_token");
 }
 
-function updateAutoCmdUI(enabled) {
-  autoCmdEnabled = !!enabled;
-  const btn = document.getElementById("auto-cmd-btn");
-  const hint = document.getElementById("auto-cmd-hint");
-  if (!btn) return;
-  if (enabled) {
-    btn.textContent = "⏸ 已启用";
-    btn.className = "btn btn-auto-cmd on";
-    if (hint) {
-      hint.textContent = "✅ 自动命令已开启：正常按时间下发心跳/温控（手动发送仍可用）";
-      hint.className = "auto-cmd-hint on";
-    }
+function setToken(t, remember) {
+  token = t;
+  if (remember) {
+    localStorage.setItem("sf_token", t);
+    sessionStorage.removeItem("sf_token");
   } else {
-    btn.textContent = "▶ 已停用";
-    btn.className = "btn btn-auto-cmd off";
-    if (hint) {
-      hint.textContent = "⏸ 自动命令已关闭：仅手动发送可用（方便调试，不会占用串口）";
-      hint.className = "auto-cmd-hint off";
-    }
+    sessionStorage.setItem("sf_token", t);
+    localStorage.removeItem("sf_token");
   }
 }
 
-async function toggleAutoCmd() {
-  const newVal = !autoCmdEnabled;
-  const btn = document.getElementById("auto-cmd-btn");
-  if (btn) { btn.disabled = true; btn.textContent = "⏳..."; }
-  try {
-    const r = await fetch(`${API}/api/auto-cmd`, {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({enabled: newVal}),
-    }).then(r => r.json());
-    if (r.ok) {
-      updateAutoCmdUI(r.enabled);
-    } else {
-      throw new Error(r.error || "切换失败");
-    }
-  } catch(e) {
-    alert("自动命令开关切换失败: " + e.message);
-    updateAutoCmdUI(autoCmdEnabled);
-  }
-  if (btn) btn.disabled = false;
+function clearToken() {
+  token = null;
+  localStorage.removeItem("sf_token");
+  sessionStorage.removeItem("sf_token");
 }
 
-async function poll() {
-  try {
-    const [tr, sr, nr, ir] = await Promise.all([
-      fetch(`${API}/api/temps`).then(r => r.json()).catch(()=>({ok:false})),
-      fetch(`${API}/api/status`).then(r => r.json()).catch(()=>({ok:false})),
-      fetch(`${API}/api/ntc`).then(r => r.json()).catch(()=>({ok:false})),
-      fetch(`${API}/api/info`).then(r => r.json()).catch(()=>({ok:false})),
-    ]);
-    // 先更新 NTC 缓存, 这样 updateTemps 写图表时 NTC 曲线能拿到最新值
-    if (nr.ok) updateNtc(nr);
-    if (tr.ok) updateTemps(tr.data);
-    if (sr.ok) updateFans(sr);
-    updateConn(ir);
-    if (ir.ok && ir.data && typeof ir.data.auto_cmd_enabled === "boolean") {
-      if (autoCmdEnabled !== ir.data.auto_cmd_enabled) {
-        updateAutoCmdUI(ir.data.auto_cmd_enabled);
+function authHeader() {
+  return { "Authorization": "Bearer " + (token || ""), "Content-Type": "application/json" };
+}
+
+// 检查登录态
+function checkAuth() {
+  token = getToken();
+  if (!token) {
+    showLogin();
+    return false;
+  }
+  // 验证 token 是否有效 (调用一个需要鉴权的接口)
+  fetch(`${API}/api/config`, { headers: authHeader() })
+    .then(r => {
+      if (r.status === 401) {
+        clearToken();
+        showLogin();
+      } else {
+        showApp();
       }
-    }
-  } catch(e) { console.error(e); }
+    })
+    .catch(() => showLogin());
+  return true;
 }
 
-function updateConn(info) {
-  const el = document.getElementById("conn-badge");
-  if (info.ok && info.data?.controller_connected) {
-    el.textContent = "🟢 已连接"; el.className = "badge online";
-    const s = info.data.uptime;
-    document.getElementById("uptime").textContent = `运行: ${Math.floor(s/3600)}h${Math.floor((s%3600)/60)}m`;
-  } else {
-    el.textContent = "🔴 未连接"; el.className = "badge";
+function showLogin() {
+  document.getElementById("login-mask").classList.remove("hidden");
+  document.getElementById("app").classList.add("hidden");
+  // 绑定登录页事件 (登录页不经过 initApp, 必须在这里绑)
+  document.getElementById("login-btn").onclick = doLogin;
+  document.getElementById("login-password").onkeydown = e => { if (e.key === "Enter") doLogin(); };
+}
+
+function showApp() {
+  document.getElementById("login-mask").classList.add("hidden");
+  document.getElementById("app").classList.remove("hidden");
+  initApp();
+}
+
+async function doLogin() {
+  const username = document.getElementById("login-username").value.trim();
+  const password = document.getElementById("login-password").value;
+  const remember = document.getElementById("login-remember").checked;
+  const errEl = document.getElementById("login-error");
+  errEl.textContent = "";
+  try {
+    const r = await fetch(`${API}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password })
+    });
+    if (!r.ok) {
+      errEl.textContent = "用户名或密码错误 (或账号已锁定, 请稍后重试)";
+      return;
+    }
+    const data = await r.json();
+    setToken(data.token, remember);
+    showApp();
+  } catch (e) {
+    errEl.textContent = "登录失败: " + e.message;
   }
+}
+
+function doLogout() {
+  clearToken();
+  if (ws) { ws.close(); ws = null; }
+  showLogin();
+}
+
+async function changePassword() {
+  const oldPwd = document.getElementById("pwd-old").value;
+  const newPwd = document.getElementById("pwd-new").value;
+  const errEl = document.getElementById("pwd-error");
+  errEl.textContent = "";
+  try {
+    const r = await fetch(`${API}/api/change-password`, {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({ oldPassword: oldPwd, newPassword: newPwd })
+    });
+    if (!r.ok) {
+      errEl.textContent = "原密码错误";
+      return;
+    }
+    closePwdModal();
+    alert("密码已修改, 请重新登录");
+    doLogout();
+  } catch (e) {
+    errEl.textContent = "修改失败: " + e.message;
+  }
+}
+
+function openPwdModal() {
+  document.getElementById("pwd-modal").classList.remove("hidden");
+  document.getElementById("pwd-old").value = "";
+  document.getElementById("pwd-new").value = "";
+  document.getElementById("pwd-error").textContent = "";
+}
+
+function closePwdModal() {
+  document.getElementById("pwd-modal").classList.add("hidden");
+}
+
+// ============================================================
+//  应用初始化
+// ============================================================
+function initApp() {
+  initChart();
+  connectWebSocket();
+  loadConfig();
+  loadHistory("24h");
+  loadDisconnectLog();
+  setInterval(loadDisconnectLog, 30000);
+  // 绑定事件
+  document.getElementById("range-select").addEventListener("change", e => loadHistory(e.target.value));
+  document.getElementById("btn-change-pwd").onclick = openPwdModal;
+  document.getElementById("btn-logout").onclick = doLogout;
+  document.getElementById("login-btn").onclick = doLogin;
+  document.getElementById("login-password").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+}
+
+// ============================================================
+//  WebSocket
+// ============================================================
+function connectWebSocket() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${proto}//${location.host}/ws?token=${encodeURIComponent(token || "")}`;
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => console.log("WebSocket 已连接");
+  ws.onmessage = onWsMessage;
+  ws.onclose = () => {
+    console.log("WebSocket 断开, 3秒后重连...");
+    setTimeout(connectWebSocket, 3000);
+  };
+  ws.onerror = e => console.error("WebSocket 错误", e);
+}
+
+function onWsMessage(event) {
+  try {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "status") {
+      updateStatus(msg.data);
+    } else if (msg.type === "log") {
+      appendLog(msg.direction, msg.content, msg.timestamp);
+    }
+  } catch (e) {
+    console.error("WS 消息解析失败", e);
+  }
+}
+
+// ============================================================
+//  状态更新
+// ============================================================
+function updateStatus(data) {
+  // 连接状态
+  const badge = document.getElementById("conn-badge");
+  badge.textContent = data.connected ? "🟢 已连接" : "⚪ 未连接";
+  badge.className = "conn-badge " + (data.connected ? "online" : "offline");
+  // 温度
+  setTemp("cpu-temp", data.cpu_temp);
+  setTemp("ssd-temp", data.ssd_temp);
+  setTemp("hdd-temp", data.hdd_temp);
+  setTemp("ntc-temp", data.ambient_temp);
+  // 硬盘标签: 只有1块时不显示"最高", >=2块才显示
+  const disks = data.disk_details || [];
+  const ssdCount = disks.filter(d => d.type === "SSD").length;
+  const hddCount = disks.filter(d => d.type === "HDD").length;
+  document.getElementById("ssd-temp").previousElementSibling.textContent = ssdCount >= 2 ? "SSD 最高" : "SSD";
+  document.getElementById("hdd-temp").previousElementSibling.textContent = hddCount >= 2 ? "HDD 最高" : "HDD";
+  // 风扇
+  document.getElementById("fan-bar").style.width = (data.fan_speed || 0) + "%";
+  document.getElementById("fan-speed-text").textContent = (data.fan_speed || 0) + "%";
+  // 风扇模式
+  const modeToggle = document.getElementById("fan-mode-toggle");
+  const modeLabel = document.getElementById("fan-mode-label");
+  const isManual = data.fan_mode === "manual";
+  modeToggle.checked = isManual;
+  modeLabel.textContent = isManual ? "手动" : "自动";
+  document.getElementById("manual-control").classList.toggle("hidden", !isManual);
+  // 计算转速 (根据当前最高温 + 配置推算, 供用户对比)
+  const calcSpeed = calcExpectedSpeed(data);
+  const calcEl = document.getElementById("calc-speed-text");
+  if (isManual) {
+    calcEl.textContent = "手动模式 (不参与自动计算)";
+  } else if (calcSpeed == null) {
+    calcEl.textContent = "-- (无温度数据)";
+  } else {
+    calcEl.textContent = calcSpeed + "%";
+  }
+  // 磁盘明细
+  renderDiskDetails(disks);
+}
+
+// 根据当前温度和配置推算目标转速 (与后端 calc_target_speed 逻辑一致)
+function calcExpectedSpeed(data) {
+  const temps = [data.cpu_temp, data.ssd_temp, data.hdd_temp].filter(t => t != null);
+  if (!temps.length) return null;
+  const hottest = Math.max(...temps);
+  const start = parseFloat(document.getElementById("cfg-start").value) || 35;
+  const maxT = parseFloat(document.getElementById("cfg-max").value) || 60;
+  if (hottest <= start) return 0;
+  if (hottest >= maxT) return 100;
+  return Math.round((hottest - start) / (maxT - start) * 100);
 }
 
 function setTemp(id, val) {
   const el = document.getElementById(id);
-  if (!el) return;
-  if (val == null) { el.textContent = "N/A"; el.className = "temp-val na"; return; }
-  el.textContent = `${val.toFixed(1)}°C`;
-  el.className = "temp-val" + (val >= 60 ? " hot" : val <= 30 ? " cold" : "");
-}
-
-function updateTemps(data) {
-  // ── 温度卡片显示 ──
-  setTemp("cpu-temp", data.cpu);
-  setTemp("ssd-temp", data.ssd);
-  setTemp("hdd-temp", data.hdd);
-
-  // ── 最高温 → 目标转速预览 ──
-  // ★ v6 修复: 环境温度(NTC) 只做参考显示, 不参与温控阈值计算
-  //   (后端 fan_control.calc_target_speed() 也同样只传 cpu/ssd/hdd)
-  const candidates = [data.cpu, data.ssd, data.hdd]
-        .filter(v => typeof v === "number" && v != null && !isNaN(v));
-  if (candidates.length) {
-    const peak = Math.max(...candidates);
-    const start = parseInt(document.getElementById("ctrl-start").value) || 35;
-    const max = parseInt(document.getElementById("ctrl-max").value) || 60;
-    const spd = peak <= start ? 0 : peak >= max ? 100 : Math.round((peak-start)/(max-start)*100);
-    document.getElementById("ctrl-preview").textContent = `${Math.round(peak)}°C → ${spd}%`;
-  }
-
-  // ── 写入图表 (4条曲线) ──
-  // v6 关键改造:
-  //   - 看历史长范围(>6小时, appendEnabled=false): 不追加, 整图由 loadHistory 一次性重绘
-  //     目的: 不把 3s/点 的实时采集和后端 1分钟/点 的历史数据混在一起造成刻度混乱
-  //   - 短范围实时查看(≤6小时, appendEnabled=true): 继续每 3s append 一个点, 保持实时感
-  //     裁剪长度按 loadHistory 时记录的 historyLabelsCount (与后端范围点数对齐)
-  if (!chart) return;
-  if (!state.appendEnabled) return;  // 长范围: 只更新卡片, 不改图表
-
-  const now = new Date();
-  const ts = now.toLocaleTimeString();  // HH:MM:SS
-  chart.data.labels.push(ts);
-
-  // 4个数据源的值(无效值填 null, Chart.js 会断开该点而不是画到0)
-  const vals = [
-    (typeof data.cpu === "number" && !isNaN(data.cpu)) ? data.cpu : null,  // 0:CPU
-    (typeof data.ssd === "number" && !isNaN(data.ssd)) ? data.ssd : null,  // 1:SSD
-    (typeof data.hdd === "number" && !isNaN(data.hdd)) ? data.hdd : null,  // 2:HDD
-    (typeof lastNtcValue === "number" && !isNaN(lastNtcValue)) ? lastNtcValue : null, // 3:NTC
-  ];
-  for (let i = 0; i < 4; i++) {
-    chart.data.datasets[i].data.push(vals[i]);
-    // ★ v6 修复: 不再使用 dataset.hidden (会让图例文字出现「删除线」, 手机端刚进页面对用户不友好)
-    //   只累计无数据计数用于其它逻辑, 不再去 hidden 控制图例。
-    //   (图例会一直显示 4 种颜色, 只是当数据源从未有有效值时曲线为空, 视觉上就没线)
-    const key = DATASET_KEYS[i];
-    if (vals[i] == null) dataMissingCount[key]++;
-    else dataMissingCount[key] = 0;
-  }
-
-  // 限制总点数: 优先按 loadHistory 返回的范围点数, 兜底 480
-  const maxLen = Math.max(1, state.historyLabelsCount || CHART_MAX_POINTS);
-  while (chart.data.labels.length > maxLen) {
-    chart.data.labels.shift();
-    chart.data.datasets.forEach(ds => ds.data.shift());
-  }
-  chart.update("none");
-}
-
-function updateNtc(data) {
-  // 更新卡片 + 缓存值(供 updateTemps 下次写图表 NTC 曲线用)
-  const el = document.getElementById("ntc-temp");
-  if (data.ok && typeof data.value === "number" && !isNaN(data.value)) {
-    lastNtcValue = data.value;
-    if (el) { el.textContent = `${data.value.toFixed(1)}°C`; el.className = "temp-val"; }
+  if (val == null) {
+    el.textContent = "N/A";
+    el.className = "temp-val";
   } else {
-    lastNtcValue = null;
-    if (el) { el.textContent = "N/A"; el.className = "temp-val na"; }
+    el.textContent = val.toFixed(1) + "°C";
+    el.className = "temp-val " + tempColorClass(val);
   }
 }
 
-// ── v6 新增: 加载后端持久化的温度历史曲线, 整图重绘 ──
-async function loadHistory(range) {
-  range = range || state.currentRange;
-  state.currentRange = range;
-  // 如果下拉框当前值和 range 不一致, 同步一下 (双向绑定)
-  const sel = document.getElementById("range-select");
-  if (sel && sel.value !== range) sel.value = range;
-
-  try {
-    const r = await fetch(`${API}/api/temps/history?range=${encodeURIComponent(range)}`).then(r => r.json());
-    if (!r || !r.ok) throw new Error((r && r.error) || "接口返回失败");
-
-    // 顶部提示: 累计记录数 / 范围 / 显示点数 (让用户知道数据在慢慢累积)
-    const hint = document.getElementById("history-hint");
-    if (hint) {
-      hint.textContent =
-        `累计 ${r.total_history_records} 条记录（每分钟1条，保留${r.retain_days}天，` +
-        `本次显示 ${r.returned_points}/${r.max_points_cap} 点）`;
-    }
-
-    state.ranges = r.ranges || [];
-    state.historyLabelsCount = r.returned_points || 60;
-    // ≤6 小时=短范围实时查看: poll 时继续 append 最新点(追加到末尾, 保持实时感)
-    // >6 小时=长范围看历史: 不做 append, 避免 3s/点 实时采集和 1min/点 历史混合造成刻度混乱
-    state.appendEnabled = (r.seconds <= 6 * 3600);
-    // 整图重绘 (后端已做降采样 + X 轴 label 格式化)
-    rebuildChartFromHistory(r.points || []);
-    state.historyLoaded = true;
-  } catch (e) {
-    console.error("加载温度历史失败:", e);
-    const hint = document.getElementById("history-hint");
-    if (hint) {
-      hint.textContent =
-        `⚠️ 历史暂无数据（刚启动请等 1-2 分钟，或手动刷新页面重试）: ${e.message}`;
-    }
-    // 失败时允许退回到 append 模式 (防止首帧没加载上导致图表一直空)
-    state.appendEnabled = true;
-    state.historyLabelsCount = CHART_MAX_POINTS;
-  }
+function tempColorClass(t) {
+  if (t < 45) return "temp-green";
+  if (t < 55) return "temp-orange";
+  return "temp-red";
 }
 
-// ── v6 新增: 用后端返回的历史点, 一次性重建整张图表 (替代原 chart.push 追加模式) ──
-function rebuildChartFromHistory(points) {
-  if (!chart) return;
-  const labels = [];
-  const dData = [[], [], [], []];   // cpu/ssd/hdd/ntc
-  const hasData = { cpu:false, ssd:false, hdd:false, ntc:false };
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i];
-    // 后端已经按范围格式化好了: 短范围 HH:MM, 长范围 MM/DD HH:MM
-    labels.push(p.label);
-    const vals = [
-      (typeof p.cpu === "number" && !isNaN(p.cpu)) ? p.cpu : null,
-      (typeof p.ssd === "number" && !isNaN(p.ssd)) ? p.ssd : null,
-      (typeof p.hdd === "number" && !isNaN(p.hdd)) ? p.hdd : null,
-      (typeof p.ntc === "number" && !isNaN(p.ntc)) ? p.ntc : null,
-    ];
-    for (let k = 0; k < 4; k++) {
-      dData[k].push(vals[k]);
-      if (vals[k] != null) hasData[DATASET_KEYS[k]] = true;
-    }
+function renderDiskDetails(disks) {
+  const list = document.getElementById("disk-list");
+  if (!disks.length) {
+    list.innerHTML = "<div class='disk-empty'>未检测到硬盘</div>";
+    return;
   }
-  chart.data.labels = labels;
-  for (let i = 0; i < 4; i++) {
-    chart.data.datasets[i].data = dData[i];
-    // ★ v6 修复: 不再设置 dataset.hidden (会在图例文字上加删除线, 刚进页面对用户不友好)
-    //   替代方案: 如果整条曲线完全没数据, 把颜色设为透明 + 边框设为虚线
-    //   这样图例显示正常 (4 个颜色框), 且没有数据的曲线在视觉上本来就不显示
-    if (!hasData[DATASET_KEYS[i]]) {
-      chart.data.datasets[i].borderColor = chart.data.datasets[i].borderColor; // 保持原颜色
-      // 不做任何隐藏, 空数据在 Chart.js 里会自然没有画线
-    }
-  }
-  // 不同范围的视觉调整:
-  //   - >1天: maxTicksLimit 调到 6, 避免跨日刻度文字堆叠
-  //   - spanGaps: 短范围 false (缺数据断开更真实), 长范围 true (合并桶后点更均匀, 连线更顺)
-  const SEC_24H = 24 * 3600;
-  const RANGE_SEC = {
-    "1h": 3600, "6h": 6*3600, "12h":12*3600, "24h": SEC_24H,
-    "3d": 3*86400, "7d":7*86400,
-  }[state.currentRange] || SEC_24H;
-  chart.options.scales.x.ticks.maxTicksLimit = RANGE_SEC > SEC_24H ? 6 : 8;
-  chart.options.spanGaps = RANGE_SEC > SEC_24H;
-  chart.update("none");
-  // 重置 dataMissingCount: 历史数据里自动判定了 hidden, 后面 append 从零重新开始累计
-  for (const k of DATASET_KEYS) dataMissingCount[k] = 0;
+  list.innerHTML = disks.map(d => {
+    const temp = d.temp == null ? "N/A" : d.temp.toFixed(1) + "°C";
+    const cls = d.temp == null ? "" : tempColorClass(d.temp);
+    return `<div class="disk-row"><span class="disk-dev">${d.device}</span><span class="disk-type">${d.type}</span><span class="disk-temp ${cls}">${temp}</span></div>`;
+  }).join("");
 }
 
-function updateFans(data) {
-  const info = data["fan1"] || {};
-  const speed = info["转速"] || "--";
-  const val = parseInt(speed) || 0;
-  const sp = document.getElementById("fan1-speed");
-  const bar = document.getElementById("fan1-bar");
-  if (sp) sp.textContent = speed;
-  if (bar) bar.style.width = val + "%";
+function toggleDiskDetails() {
+  const list = document.getElementById("disk-list");
+  const arrow = document.getElementById("disk-arrow");
+  list.classList.toggle("hidden");
+  arrow.textContent = list.classList.contains("hidden") ? "▶" : "▼";
 }
 
+// ============================================================
+//  图表
+// ============================================================
 function initChart() {
-  const ctx = document.getElementById("temp-chart");
-  if (!ctx) return;
-
-  // ★ v6 图例布局自适应:
-  //   手机端 (<=680px) 缩小方框+字体+间距, 4 个图例一行放下, 避免环境温度自动折第二行
-  const isMobile = window.innerWidth <= 680;
-  const LEG_BOX = isMobile ? 11 : 14;          // 方框宽度(手机更小)
-  const LEG_PAD = isMobile ? 6  : 10;          // 图例间距
-  const LEG_FNT = isMobile ? 10 : 12;          // 字号
-
-  chart = new Chart(ctx, {
-    type: "line",
-    data: {
-      labels: [],
-      datasets: [
-        // 0: CPU — 红色
-        { label:"CPU 温度",
-          borderColor:"#ef4444", backgroundColor:"rgba(239,68,68,0.08)",
-          fill:true, tension:0.3, pointRadius:0, pointHoverRadius:3, borderWidth:2 },
-        // 1: SSD — 绿色
-        { label:"SSD 温度",
-          borderColor:"#34d399", backgroundColor:"rgba(52,211,153,0.05)",
-          fill:false, tension:0.3, pointRadius:0, pointHoverRadius:2, borderWidth:1.8 },
-        // 2: HDD — 橙色
-        { label:"HDD 温度",
-          borderColor:"#f59e0b", backgroundColor:"rgba(245,158,11,0.05)",
-          fill:false, tension:0.3, pointRadius:0, pointHoverRadius:2, borderWidth:1.8 },
-        // 3: 环境温度 NTC — 蓝色
-        { label:"环境温度",
-          borderColor:"#3b82f6", backgroundColor:"rgba(59,130,246,0.05)",
-          fill:false, tension:0.3, pointRadius:0, pointHoverRadius:2, borderWidth:1.8 },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: { duration: 200 },
-      spanGaps: false,   // 数据空缺的位置要断开(不连虚线), 真实反映采集失败
-      scales: {
-        x: {
-          // ★ v2 修复: 显示时间轴, 不再隐藏
-          display: true,
-          grid: { display: false },
-          ticks: {
-            color: "#888a9e",
-            font: { size: 9 },
-            maxRotation: 0,
-            autoSkip: true,
-            // 最多显示 8 个时间刻度, 避免文字堆叠
-            maxTicksLimit: 8,
-          },
-        },
-        y: {
-          min: 10, max: 80,
-          grid: { color: "rgba(255,255,255,0.05)" },
-          ticks: {
-            color: "#888a9e",
-            font: { size: 10 },
-            callback: (v) => v + "°C",
-          },
-        },
-      },
-      plugins: {
-        legend: {
-          position: "top",
-          align: "start",
-          // 防手机误触 (点一下颜色框曲线就消失)
-          onClick: null,
-          labels: {
-            // ★ v6 自适应方框+字号+间距 (LEG_* 上面按屏幕宽度算的):
-            //   PC 端: box14 / pad10 / font12 (默认舒适大小)
-            //   手机端: box11 / pad6  / font10 (紧凑, 4 个一行放下, 环境温度不会折行)
-            boxWidth: LEG_BOX,
-            boxHeight: Math.round(LEG_BOX * 0.75),
-            padding: LEG_PAD,
-            font: { size: LEG_FNT },
-            // ★ v6 generateLabels (这次写齐所有字段, 再也不出现黑字/黑边框!)
-            generateLabels: (chart) => {
-              return chart.data.datasets.map((ds, i) => ({
-                text: ds.label,
-                // ★ 方框内部填充白色 (用户明确要求)
-                fillStyle: "#ffffff",
-                // ★ 方框边框颜色 = 曲线本身的实色 (红/绿/橙/蓝)
-                strokeStyle: ds.borderColor,
-                lineWidth: 2,               // 边框粗 2px, 醒目
-                // ★ 文字颜色必须显式设置 (自定义 generateLabels 后外层 color 会失效, 不写=黑色!)
-                fontColor: "#c9ccd8",
-                // ★ 防删除线 + 禁用图例点击隐藏曲线
-                hidden: false,
-                index: i,
-              }));
-            },
-          },
-        },
-        tooltip: {
-          mode: "index",
-          intersect: false,
-          callbacks: {
-            label: (ctx) => {
-              const v = ctx.parsed.y;
-              if (v == null || isNaN(v)) return null;
-              return `${ctx.dataset.label}: ${v.toFixed(1)}°C`;
-            },
-          },
-        },
-      },
-    },
-  });
+  const dom = document.getElementById("temp-chart");
+  chart = echarts.init(dom);
+  window.addEventListener("resize", () => chart.resize());
 }
 
-// ── 温控配置 ──
+async function loadHistory(range) {
+  try {
+    const r = await fetch(`${API}/api/temperature/history?range=${range}`, { headers: authHeader() });
+    const data = await r.json();
+    if (!data.ok || !data.points) return;
+    const labels = data.points.map(p => p.label);
+    const series = [
+      { name: "CPU", data: data.points.map(p => p.cpu), color: "#ff6b6b" },
+      { name: "SSD", data: data.points.map(p => p.ssd), color: "#4ecdc4" },
+      { name: "HDD", data: data.points.map(p => p.hdd), color: "#ffd93d" },
+      { name: "环境", data: data.points.map(p => p.ntc), color: "#a8e6cf" },
+    ].filter(s => s.data.some(v => v != null));
+    chart.setOption({
+      tooltip: { trigger: "axis" },
+      legend: {
+        data: series.map(s => s.name), top: 0,
+        textStyle: { color: "#fff" },
+        inactiveColor: "#888"
+      },
+      grid: { top: 40, bottom: 30, left: 40, right: 20 },
+      xAxis: { type: "category", data: labels },
+      yAxis: { type: "value", name: "°C" },
+      series: series.map(s => ({
+        name: s.name, type: "line", data: s.data, smooth: true,
+        lineStyle: { color: s.color }, itemStyle: { color: s.color }, showSymbol: false
+      }))
+    });
+  } catch (e) {
+    console.error("加载历史数据失败", e);
+  }
+}
+
+// ============================================================
+//  风扇控制
+// ============================================================
+async function onFanModeChange() {
+  const isManual = document.getElementById("fan-mode-toggle").checked;
+  const mode = isManual ? "manual" : "auto";
+  document.getElementById("fan-mode-label").textContent = isManual ? "手动" : "自动";
+  document.getElementById("manual-control").classList.toggle("hidden", !isManual);
+  try {
+    const r = await fetch(`${API}/api/temperature/config`, {
+      method: "POST", headers: authHeader(),
+      body: JSON.stringify({ fan_mode: mode })
+    });
+    const data = await r.json();
+    // 切换模式后后端会立即下发, 用返回的确认转速更新进度条
+    if (data.ok && data.fan_speed !== undefined) {
+      updateFanBar(data.fan_speed);
+    }
+  } catch (e) {
+    console.error("切换模式失败", e);
+  }
+}
+
+function updateFanBar(speed) {
+  document.getElementById("fan-bar").style.width = speed + "%";
+  document.getElementById("fan-speed-text").textContent = speed + "%";
+}
+
+function onFanSliderInput() {
+  const val = document.getElementById("fan-slider").value;
+  document.getElementById("fan-slider-val").textContent = val + "%";
+  // 300ms 防抖
+  clearTimeout(sliderDebounceTimer);
+  sliderDebounceTimer = setTimeout(() => sendManualDuty(parseInt(val)), 300);
+}
+
+async function sendManualDuty(duty) {
+  try {
+    const r = await fetch(`${API}/api/temperature/config`, {
+      method: "POST", headers: authHeader(),
+      body: JSON.stringify({ manual_duty: duty })
+    });
+    const data = await r.json();
+    // 只能根据控制器返回的确认值更新进度条
+    if (data.ok && data.fan_speed !== undefined) {
+      updateFanBar(data.fan_speed);
+    }
+  } catch (e) {
+    console.error("设置风扇转速失败", e);
+  }
+}
+
+// ============================================================
+//  配置
+// ============================================================
 async function loadConfig() {
   try {
-    const r = await fetch(`${API}/api/control`).then(r => r.json());
-    if (!r.ok) return;
-    document.getElementById("ctrl-start").value = r.data.start;
-    document.getElementById("ctrl-max").value = r.data.max;
-  } catch(e) { console.error(e); }
-}
-document.addEventListener("change", e => {
-  if (e.target.id === "ctrl-start" || e.target.id === "ctrl-max") {
-    const start = parseInt(document.getElementById("ctrl-start").value) || 0;
-    const max = parseInt(document.getElementById("ctrl-max").value) || 0;
-    // ── ★ 严格遵守规则: 进度条更新只能来自控制器返回的确认转速
-    //    前端在这里不做任何乐观更新, 进度条要等后端 PUT 返回的
-    //    immediate.send_result.value (即 set_fan_speed 解析到的 F1_CPD=xx% 确认值)
-    //    才更新, 或等后续 poll /api/status 读到缓存更新.
-    //  后台发PUT保存配置 + 立即下发真命令 (不await, 不阻塞UI)
-    fetch(`${API}/api/control`, {
-      method:"PUT", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({start, max}),
-    }).then(async r => {
-      try {
-        const jr = await r.json();
-        // 后端返回的 immediate: {target_speed, send_result: {ok, value}}
-        // send_result.value 就是 set_fan_speed 从控制器 RX "F1_CPD=xx%" 里解析出来的确认值
-        // → 这是"收到控制器返回的转速", 合法地更新进度条
-        if (jr && jr.ok && jr.immediate && typeof jr.immediate.send_result === "object"
-            && jr.immediate.send_result.ok && typeof jr.immediate.send_result.value === "number") {
-          applyOptimisticFanSpeed(jr.immediate.send_result.value);
-          updateFans({
-            ok: true, auto_cmd_enabled: autoCmdEnabled,
-            fan1: { "转速": jr.immediate.send_result.value + "%" },
-            fan2: { "转速": "--" },
-          });
-          // 再触发一次刷新(后台跑), 让其余数据(温度/图表等)和真采温度对齐
-          refreshFansNow();
-        }
-      } catch(_) {}
-    }).catch(()=>{});
-    // 配置改了, 立即重算预览
-    syncPreviewFromDom();
-  }
-});
-
-/** 从当前DOM上的温度显示值计算最高温和目标转速(纯前端, 不访问后端).
- *  用于"点执行后立即更新UI", 让用户感觉响应是即时的,
- *  不用等后端串行4个串口命令(~8秒)才看到进度条变化.
- */
-function calcTargetFromDom() {
-  const parseVal = (id) => {
-    const el = document.getElementById(id);
-    if (!el) return null;
-    const txt = el.textContent.replace(/°C/g, "").trim();
-    if (txt === "N/A" || txt === "--" || txt === "") return null;
-    const v = parseFloat(txt);
-    return isNaN(v) ? null : v;
-  };
-  // ★ v6 修复: 环境温度(ntc-temp) 不参与温控计算, 只从 cpu/ssd/hdd 三个里取最高
-  const vals = ["cpu-temp", "ssd-temp", "hdd-temp"]
-        .map(parseVal).filter(v => typeof v === "number");
-  if (!vals.length) return { peak: null, target: null };
-  const peak = Math.max(...vals);
-  const start = parseInt(document.getElementById("ctrl-start").value) || 35;
-  const max = parseInt(document.getElementById("ctrl-max").value) || 60;
-  const target = peak <= start ? 0 : peak >= max ? 100 : Math.round((peak-start)/(max-start)*100);
-  return { peak, target };
-}
-
-/** 同步预览文字(最高温→目标转速) */
-function syncPreviewFromDom() {
-  const { peak, target } = calcTargetFromDom();
-  if (peak != null && target != null) {
-    document.getElementById("ctrl-preview").textContent = `${Math.round(peak)}°C → ${target}%`;
-  }
-}
-
-/** 乐观更新风扇进度条: 点执行后立即显示预期转速, 不等后端确认 */
-function applyOptimisticFanSpeed(targetPercent) {
-  const bar = document.getElementById("fan1-bar");
-  const sp = document.getElementById("fan1-speed");
-  if (bar) bar.style.width = targetPercent + "%";
-  if (sp) sp.textContent = targetPercent + "%";
-}
-
-// 立即刷新一次风扇转速和温度(不等3秒轮询), 用于手动操作后尽快更新
-async function refreshFansNow() {
-  try {
-    const [sr, nr, tr] = await Promise.all([
-      fetch(`${API}/api/status`).then(r => r.json()).catch(()=>({ok:false})),
-      fetch(`${API}/api/ntc`).then(r => r.json()).catch(()=>({ok:false})),
-      fetch(`${API}/api/temps`).then(r => r.json()).catch(()=>({ok:false})),
-    ]);
-    if (nr.ok) updateNtc(nr);
-    if (tr.ok) updateTemps(tr.data);
-    if (sr.ok) updateFans(sr);
-  } catch(e) { console.error(e); }
-}
-
-/**
- * 执行按钮(核心优化):
- *   旧流程: 点按钮 → 等后端8秒(温度采集+4个串口) → 按钮恢复+UI刷新
- *   新流程: 点按钮 → 100ms 内: 前端计算预期转速 → 进度条立刻动 → 按钮变"已执行"
- *           → 0.5秒后按钮恢复可点击(用户无需等8秒)
- *           → 后端请求后台完成后, 再把真实返回的结果修正回UI(如果和预期一致就没变)
- */
-async function runControl() {
-  const btn = event?.target;
-
-  // ── ① 立即乐观更新 (耗时 < 50ms, 用户感觉"秒响应") ──
-  const { peak, target } = calcTargetFromDom();
-  if (target != null) {
-    applyOptimisticFanSpeed(target);
-  }
-  // 按钮立即变"执行中..."样式, 但只 disabled 很短时间
-  if (btn) {
-    btn.textContent = "⚡ 已执行";
-    btn.classList.add("exec-flash");
-    btn.disabled = true;
-  }
-  // 0.5 秒后按钮恢复可点击(而不是等后端8秒).
-  // 这样即使后端慢, 用户也可以连续点两次(比如改了配置后马上再执行)
-  setTimeout(() => {
-    if (btn) {
-      btn.textContent = "▶ 执行";
-      btn.classList.remove("exec-flash");
-      btn.disabled = false;
+    const r = await fetch(`${API}/api/config`, { headers: authHeader() });
+    const data = await r.json();
+    if (data.ok && data.config) {
+      document.getElementById("cfg-start").value = data.config.start_temp || 35;
+      document.getElementById("cfg-max").value = data.config.max_temp || 60;
     }
-  }, 500);
-
-  // ── ② 后台异步发请求, 不阻塞 UI ──
-  (async () => {
-    try {
-      const r = await fetch(`${API}/api/control/run`, {method:"POST"}).then(r => r.json());
-      if (r.ok) {
-        // v7优化: 后端返回里已经包含 set_fan_speed 的确认值(fan1/fan2)
-        // 直接用确认值更新进度条, 不再等 refreshFansNow 额外请求, 快1~2秒
-        const confirmed = typeof r.fan1 === "number" ? r.fan1 : r.target_speed;
-        if (typeof confirmed === "number") {
-          applyOptimisticFanSpeed(confirmed);
-        }
-        // 手动构造一个类似 /api/status 的结构传给 updateFans, 同步刷新 F1/F2 卡片
-        updateFans({
-          ok: true,
-          auto_cmd_enabled: autoCmdEnabled,
-          fan1: { "转速": (typeof r.fan1 === "number" ? r.fan1 : "--") + (typeof r.fan1 === "number" ? "%" : "") },
-          fan2: { "转速": (typeof r.fan2 === "number" ? r.fan2 : "--") + (typeof r.fan2 === "number" ? "%" : "") },
-        });
-        // 触发一次后台刷新(不await, 不阻塞), 用于对齐温度/图表等其余数据
-        refreshFansNow();
-      }
-    } catch(e) { console.error("runControl 后台执行失败:", e); }
-  })();
+  } catch (e) {
+    console.error("加载配置失败", e);
+  }
 }
 
-async function resetControl() {
+async function saveConfig() {
+  const start = parseInt(document.getElementById("cfg-start").value);
+  const max = parseInt(document.getElementById("cfg-max").value);
   try {
-    const r = await fetch(`${API}/api/control/reset`, {method:"POST"}).then(r => r.json());
-    if (r.ok) await loadConfig();
-  } catch(e) { console.error(e); }
+    await fetch(`${API}/api/temperature/config`, {
+      method: "POST", headers: authHeader(),
+      body: JSON.stringify({ start_temp: start, max_temp: max })
+    });
+    alert("配置已保存");
+  } catch (e) {
+    alert("保存失败: " + e.message);
+  }
 }
 
-// ── 原始命令 ──
-async function sendRaw() {
-  const input = document.getElementById("raw-cmd");
-  const pre = document.getElementById("raw-response");
-  const cmd = input.value.trim();
-  if (!cmd) return;
-  pre.textContent = `> ${cmd}\n发送中...`;
+// ============================================================
+//  断连记录
+// ============================================================
+async function loadDisconnectLog() {
   try {
-    const r = await fetch(`${API}/api/raw`, {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({cmd}),
-    }).then(r => r.json());
-    pre.textContent = `> ${cmd}\n\n${r.response || "(空)"}`;
-    if (r.ok) {
-      const upper = cmd.toUpperCase();
-      if (upper.includes("CPD=") || upper.includes("ALL")
-          || upper.startsWith("F1") || upper.startsWith("F2")) {
-        await refreshFansNow();
-      }
-    }
-  } catch(e) { pre.textContent = `> ${cmd}\n\n❌ ${e.message}`; }
-}
-
-// ── 调试日志 ──
-async function refreshLog() {
-  const el = document.getElementById("debug-log");
-  if (!el) return;
-  try {
-    const r = await fetch(`${API}/api/log`).then(r => r.json());
-    if (!r.ok) { el.textContent = "获取日志失败"; return; }
-    el.textContent = r.log.map(e => {
-      const t = new Date(e.t * 1000).toLocaleTimeString();
-      const icon = e.dir === "TX" ? "→" : e.dir === "RX" ? "←" : "●";
-      return `${t} ${icon} ${e.data}`;
-    }).join("\n") || "(暂无日志)";
-  } catch(e) { el.textContent = `❌ ${e.message}`; }
-}
-setInterval(refreshLog, 5000);
-
-// ── 通用可折叠卡片(断连记录 / 调试日志) ──
-function toggleCard(cardId) {
-  const card = document.getElementById(cardId);
-  if (!card) return;
-  card.classList.toggle("collapsed");
-  const collapsed = card.classList.contains("collapsed");
-  card.querySelectorAll("[data-fold-btn]").forEach(b => b.textContent = collapsed ? "展开" : "折叠");
-}
-
-async function refreshDiscLog() {
-  const body = document.getElementById("disc-body");
-  const status = document.getElementById("disc-status");
-  if (!body) return;
-  try {
-    const r = await fetch(`${API}/api/disconnect-log?limit=50`).then(r => r.json());
-    if (!r.ok) { body.innerHTML = '<div class="disc-empty">获取失败</div>'; return; }
-    if (status) {
-      if (r.currently_disconnected) {
-        status.textContent = "断连中";
-        status.className = "disc-status off";
-      } else {
-        status.textContent = "正常";
-        status.className = "disc-status on";
-      }
-    }
-    if (!r.entries || r.entries.length === 0) {
-      body.innerHTML = '<div class="disc-empty">暂无断连记录</div>';
+    const r = await fetch(`${API}/api/disconnect-log`, { headers: authHeader() });
+    const data = await r.json();
+    if (!data.ok) return;
+    const list = document.getElementById("disc-list");
+    if (!data.entries || !data.entries.length) {
+      list.innerHTML = "暂无断连记录";
       return;
     }
-    body.innerHTML = r.entries.map(e => {
-      const cls = e.status === "recovered" ? "recovered" : "disconnected";
-      let dur = "";
-      if (e.duration_s != null) {
-        const s = e.duration_s;
-        dur = s >= 60 ? ` · 持续 ${Math.floor(s/60)}分${s%60}秒` : ` · 持续 ${s}秒`;
-      } else {
-        dur = " · 进行中";
-      }
-      const end = e.end ? ` → ${e.end}` : " → ...";
-      return `<div class="disc-entry ${cls}">
-        <span class="disc-time">${e.start}${end}</span>
-        <span class="disc-dur">${e.status === "recovered" ? "已恢复" : "未恢复"}${dur}</span>
-      </div>`;
+    list.innerHTML = data.entries.map(e => {
+      const status = e.status === "disconnected" ? '<span style="color:var(--red)">● 断连中</span>' : '<span style="color:var(--green)">● 已恢复</span>';
+      const dur = e.duration_s != null ? ` (${e.duration_s}s)` : "";
+      return `<div class="disc-item">${status} ${e.start} → ${e.end || "..." + dur}</div>`;
     }).join("");
-  } catch(e) {
-    body.innerHTML = `<div class="disc-empty">❌ ${e.message}</div>`;
+  } catch (e) {
+    console.error("加载断连记录失败", e);
   }
 }
-setTimeout(refreshDiscLog, 800);
-setInterval(refreshDiscLog, 10000);
+
+// ============================================================
+//  命令终端
+// ============================================================
+async function sendRaw() {
+  const cmd = document.getElementById("raw-cmd").value.trim();
+  if (!cmd) return;
+  try {
+    const r = await fetch(`${API}/api/command`, {
+      method: "POST", headers: authHeader(),
+      body: JSON.stringify({ content: cmd })
+    });
+    const data = await r.json();
+    if (data.response) {
+      appendLog("rx", data.response, Date.now());
+    }
+  } catch (e) {
+    console.error("发送命令失败", e);
+  }
+}
+
+// ============================================================
+//  通信日志
+// ============================================================
+const MAX_LOG_LINES = 100;
+function appendLog(direction, content, timestamp) {
+  const logBox = document.getElementById("comm-log");
+  const ts = new Date(timestamp).toLocaleTimeString();
+  const prefix = direction === "tx" ? "→ TX" : "← RX";
+  const line = `[${ts}] ${prefix}: ${content}\n`;
+  logBox.textContent += line;
+  // 限制行数
+  const lines = logBox.textContent.split("\n");
+  if (lines.length > MAX_LOG_LINES) {
+    logBox.textContent = lines.slice(-MAX_LOG_LINES).join("\n");
+  }
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+// ============================================================
+//  折叠 / 页面切换
+// ============================================================
+function toggleCard(id) {
+  const body = document.getElementById(id);
+  body.classList.toggle("collapsed");
+  const btn = document.querySelector(`[onclick="toggleCard('${id}')"] .fold-btn`);
+  if (btn) btn.textContent = body.classList.contains("collapsed") ? "展开" : "收起";
+}
+
+function switchPage(page) {
+  // 移动端: 切换显示区域
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.page === page));
+  const monitor = document.getElementById("page-monitor");
+  const right = document.querySelector(".col-right");
+  // 配置/日志分组卡片
+  const configCards = document.querySelectorAll('.col-right [data-group="config"]');
+  const logCards = document.querySelectorAll('.col-right [data-group="log"]');
+
+  if (page === "monitor") {
+    monitor.classList.remove("hidden");
+    right.classList.add("hidden");
+    // 切回监控页时让 ECharts 重新计算尺寸 (移动端切页后容器尺寸变化)
+    if (typeof chart !== "undefined" && chart) {
+      setTimeout(() => chart.resize(), 50);
+    }
+  } else {
+    monitor.classList.add("hidden");
+    right.classList.remove("hidden");
+    // 配置页只显示配置组, 日志页只显示日志组
+    configCards.forEach(c => c.classList.toggle("hidden", page !== "config"));
+    logCards.forEach(c => c.classList.toggle("hidden", page !== "log"));
+  }
+}
+
+// ============================================================
+//  启动
+// ============================================================
+document.addEventListener("DOMContentLoaded", () => {
+  checkAuth();
+});

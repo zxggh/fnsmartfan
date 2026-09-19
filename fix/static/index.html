@@ -3,143 +3,186 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>智能风扇控制器</title>
-<link rel="stylesheet" href="/static/style.css?v=5">
+<title>SmartFan Nexus</title>
+<link rel="stylesheet" href="/static/style.css?v=3">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
-<header>
-  <div class="header-left">
-    <h1>🌬️ 智能风扇控制器</h1>
-    <span class="subtitle">NAS 线性温控系统</span>
-  </div>
-  <div class="header-right">
-    <span class="badge" id="conn-badge">⚪ 未连接</span>
-    <span class="uptime" id="uptime">运行: --</span>
-  </div>
-</header>
 
-<main>
-  <!-- 左栏: 仪表盘 -->
-  <section class="dashboard">
-    <div class="card temp-card">
-      <div class="card-header temp-header-row">
-        <span>🌡️ 系统温度</span>
-        <!-- v6 新增: 历史曲线时间范围选择 + 累计记录数提示 -->
-        <div class="temp-header-actions">
-          <span id="history-hint" class="history-hint">累计 -- 条记录（每分钟1条，保留7天）</span>
-          <select id="range-select" class="range-select" title="选择温度曲线显示的时间范围">
+<!-- ============ 登录遮罩 ============ -->
+<div id="login-mask" class="login-mask">
+  <div class="login-box">
+    <h2>🌬️ SmartFan Nexus</h2>
+    <p class="login-sub">NAS 智能风扇温控系统</p>
+    <div class="login-field">
+      <label>用户名</label>
+      <input type="text" id="login-username" value="admin" autocomplete="username">
+    </div>
+    <div class="login-field">
+      <label>密码</label>
+      <input type="password" id="login-password" value="admin" autocomplete="current-password">
+    </div>
+    <div class="login-options">
+      <label class="remember-me">
+        <input type="checkbox" id="login-remember"> 记住我
+      </label>
+    </div>
+    <button class="btn btn-primary btn-login" id="login-btn">登 录</button>
+    <p class="login-error" id="login-error"></p>
+    <p class="login-tip">默认账号 admin / admin，登录后请及时修改密码</p>
+  </div>
+</div>
+
+<!-- ============ 主界面 ============ -->
+<div id="app" class="app hidden">
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1>🌬️ SmartFan Nexus</h1>
+      <span class="conn-badge" id="conn-badge">⚪ 未连接</span>
+    </div>
+    <div class="topbar-right">
+      <button class="icon-btn" id="btn-change-pwd" title="修改密码">🔑</button>
+      <button class="icon-btn" id="btn-logout" title="退出登录">🚪</button>
+    </div>
+  </header>
+
+  <!-- 主体 (PC: 左右双栏; 移动: 单列) -->
+  <main class="main-layout">
+    <!-- 左栏: 监控 -->
+    <section class="col-left" id="page-monitor">
+      <!-- 温度卡片 -->
+      <div class="card">
+        <div class="card-header">
+          <span>🌡️ 系统温度</span>
+          <select id="range-select" class="range-select">
             <option value="1h">最近 1 小时</option>
-            <option value="6h">最近 6 小时</option>
-            <option value="12h">最近 12 小时</option>
             <option value="24h" selected>最近 24 小时</option>
             <option value="3d">最近 3 天</option>
             <option value="7d">最近 7 天</option>
+            <option value="30d">最近 30 天</option>
           </select>
         </div>
-      </div>
-      <div class="card-body">
         <div class="temp-grid">
           <div class="temp-item"><label>CPU</label><span id="cpu-temp" class="temp-val">--</span></div>
-          <div class="temp-item"><label>SSD</label><span id="ssd-temp" class="temp-val">--</span></div>
-          <div class="temp-item"><label>HDD</label><span id="hdd-temp" class="temp-val">--</span></div>
-          <div class="temp-item"><label>🌡️ 环境温度</label><span id="ntc-temp" class="temp-val">--</span></div>
+          <div class="temp-item"><label>SSD 最高</label><span id="ssd-temp" class="temp-val">--</span></div>
+          <div class="temp-item"><label>HDD 最高</label><span id="hdd-temp" class="temp-val">--</span></div>
+          <div class="temp-item"><label>环境</label><span id="ntc-temp" class="temp-val">--</span></div>
+        </div>
+        <!-- 磁盘明细展开面板 -->
+        <div class="disk-details" id="disk-details">
+          <div class="disk-toggle" onclick="toggleDiskDetails()">📋 磁盘明细 <span id="disk-arrow">▶</span></div>
+          <div class="disk-list hidden" id="disk-list"></div>
         </div>
         <div class="chart-container">
-          <canvas id="temp-chart"></canvas>
+          <div id="temp-chart"></div>
         </div>
       </div>
-    </div>
 
-    <div class="card fan-card">
-      <div class="card-header">🌀 风扇状态</div>
-      <div class="card-body">
-        <div class="fan-grid">
-          <div class="fan-item" id="fan1">
-            <h3>FAN</h3>
-            <div class="fan-gauge">
-              <div class="gauge-bar"><div class="gauge-fill" id="fan1-bar" style="width:0%"></div></div>
-            </div>
-            <div class="fan-info">
-              <span>转速: <strong id="fan1-speed">--</strong></span>
-            </div>
+      <!-- 风扇状态 -->
+      <div class="card">
+        <div class="card-header">
+          <span>🌀 风扇状态</span>
+          <label class="mode-switch">
+            <input type="checkbox" id="fan-mode-toggle" onchange="onFanModeChange()">
+            <span class="mode-label" id="fan-mode-label">自动</span>
+          </label>
+        </div>
+        <div class="fan-gauge">
+          <div class="gauge-bar"><div class="gauge-fill" id="fan-bar" style="width:0%"></div></div>
+          <span class="gauge-text" id="fan-speed-text">0%</span>
+        </div>
+        <!-- 手动模式滑块 -->
+        <div class="manual-control hidden" id="manual-control">
+          <input type="range" id="fan-slider" min="0" max="100" value="50" oninput="onFanSliderInput()">
+          <span id="fan-slider-val">50%</span>
+        </div>
+        <!-- 计算转速 (根据当前温度推算, 供用户对比进度条) -->
+        <div class="calc-speed" id="calc-speed-row" style="margin-top:8px;font-size:13px;color:#8ab4f8;">
+          当前温度推算转速: <span id="calc-speed-text">--</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右栏: 配置与日志 -->
+    <section class="col-right">
+      <!-- 温控配置 -->
+      <div class="card" id="page-config" data-group="config">
+        <div class="card-header">⚙️ 温控配置</div>
+        <div class="card-body">
+          <div class="ctrl-row">
+            <span>启动温度 <input type="number" id="cfg-start" value="35" min="0" max="100"> °C</span>
+          </div>
+          <div class="ctrl-row">
+            <span>全速温度 <input type="number" id="cfg-max" value="60" min="0" max="100"> °C</span>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="saveConfig()">💾 保存配置</button>
+        </div>
+      </div>
+
+      <!-- 命令终端 -->
+      <div class="card" id="page-config2" data-group="config">
+        <div class="card-header">🖥️ 命令终端</div>
+        <div class="card-body">
+          <div class="raw-input">
+            <input type="text" id="raw-cmd" placeholder="如: AMB_TMP? / F1_CUR_DUTY=80" onkeydown="if(event.key==='Enter')sendRaw()">
+            <button class="btn btn-primary btn-sm" onclick="sendRaw()">发送</button>
           </div>
         </div>
       </div>
-    </div>
-  </section>
 
-  <!-- 右栏: 控制面板 -->
-  <section class="control-panel">
-    <div class="card">
-      <!-- v6 修复: 温控配置卡片 header 双层布局
-           - 左: 标题独占一行 (「⚙️ 温控配置」)
-           - 右 actions 组: 说明文字 + 执行/默认按钮, 手机端自动跳到第二行, 不再拥挤 -->
-      <div class="card-header ctrl-card-header">
-        <div class="ctrl-header-title">⚙️ 温控配置</div>
-        <div class="ctrl-header-actions">
-          <span class="ctrl-desc">取最高温→线性映射→设风扇</span>
-          <button class="btn btn-sm btn-primary" onclick="runControl()">▶ 执行</button>
-          <button class="btn btn-sm" onclick="resetControl()">↺ 默认</button>
+      <!-- 通信日志 -->
+      <div class="card" id="page-log" data-group="log">
+        <div class="card-header" onclick="toggleCard('log-card-body')">
+          <span>📜 通信日志</span>
+          <span class="fold-btn" id="log-fold-btn">展开</span>
+        </div>
+        <div class="card-body collapsible" id="log-card-body">
+          <pre id="comm-log" class="log-box"></pre>
         </div>
       </div>
-      <div class="card-body">
-        <div class="ctrl-row">
-          <label>🌡️</label>
-          <span>启动 <input type="number" id="ctrl-start" value="35" min="0" max="100"> °C</span>
-          <span>最高 <input type="number" id="ctrl-max" value="60" min="0" max="100"> °C</span>
-        </div>
-        <div style="font-size:12px;color:var(--text-muted);margin-top:8px;text-align:center">
-          最高温 → <strong id="ctrl-preview" style="color:var(--warning)">--</strong>
-        </div>
-      </div>
-    </div>
 
-    <div class="card">
-      <div class="card-header">
-        <span>🖥️ 原始命令</span>
-        <div class="auto-cmd-switch">
-          <span class="auto-cmd-label">自动命令</span>
-          <button class="btn btn-auto-cmd" id="auto-cmd-btn" onclick="toggleAutoCmd()">⏸ 已启用</button>
+      <!-- 断连记录 -->
+      <div class="card" id="page-log2" data-group="log">
+        <div class="card-header" onclick="toggleCard('disc-card-body')">
+          <span>🔌 断连记录</span>
+          <span class="fold-btn" id="disc-fold-btn">展开</span>
+        </div>
+        <div class="card-body collapsible" id="disc-card-body">
+          <div id="disc-list" class="disc-list">暂无断连记录</div>
         </div>
       </div>
-      <div class="card-body">
-        <div class="raw-input">
-          <input type="text" id="raw-cmd" placeholder="如: GETNTC? / F1CPD? / F1CPD=80 / ALL"
-                 onkeydown="if(event.key==='Enter')sendRaw()">
-          <button class="btn btn-primary" onclick="sendRaw()">发送</button>
-        </div>
-        <div class="auto-cmd-hint" id="auto-cmd-hint">
-          ✅ 自动命令已开启：正常按时间下发心跳/温控（手动发送仍可用）
-        </div>
-        <pre id="raw-response" class="raw-response">等待命令...</pre>
-      </div>
-    </div>
+    </section>
+  </main>
 
-    <div class="card collapsible collapsed" id="debug-card">
-      <div class="card-header" onclick="toggleCard('debug-card')">
-        <span>🔍 调试日志</span>
-        <button class="btn btn-sm" onclick="event.stopPropagation();refreshLog()">⟳ 刷新</button>
-        <button class="btn btn-sm" data-fold-btn onclick="event.stopPropagation();toggleCard('debug-card')" style="margin-left:auto">展开</button>
-      </div>
-      <div class="card-body">
-        <pre id="debug-log" class="raw-response" style="max-height:300px;font-size:11px;color:var(--text)">加载中...</pre>
-      </div>
-    </div>
+  <!-- 移动端底部导航 -->
+  <nav class="mobile-nav" id="mobile-nav">
+    <button class="nav-btn active" data-page="monitor" onclick="switchPage('monitor')">📊 监控</button>
+    <button class="nav-btn" data-page="config" onclick="switchPage('config')">⚙️ 配置</button>
+    <button class="nav-btn" data-page="log" onclick="switchPage('log')">📜 日志</button>
+  </nav>
+</div>
 
-    <div class="card disc-card collapsible collapsed" id="disc-card">
-      <div class="card-header" onclick="toggleCard('disc-card')">
-        <span>🔌 断连记录</span>
-        <span id="disc-status" class="disc-status">--</span>
-        <button class="btn btn-sm" data-fold-btn onclick="event.stopPropagation();toggleCard('disc-card')" style="margin-left:auto">展开</button>
-      </div>
-      <div class="card-body disc-body-wrap" id="disc-body">
-        <div class="disc-empty">暂无断连记录</div>
-      </div>
+<!-- ============ 修改密码弹窗 ============ -->
+<div id="pwd-modal" class="modal-mask hidden">
+  <div class="modal-box">
+    <h3>修改密码</h3>
+    <div class="login-field">
+      <label>原密码</label>
+      <input type="password" id="pwd-old">
     </div>
-  </section>
-</main>
+    <div class="login-field">
+      <label>新密码</label>
+      <input type="password" id="pwd-new">
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closePwdModal()">取消</button>
+      <button class="btn btn-primary" onclick="changePassword()">确认修改</button>
+    </div>
+    <p class="login-error" id="pwd-error"></p>
+  </div>
+</div>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<script src="/static/app.js?v=5"></script>
+<script src="/static/app.js?v=3"></script>
 </body>
 </html>

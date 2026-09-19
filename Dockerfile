@@ -95,7 +95,7 @@ RUN /app/venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true \
       --trusted-host pypi.org --trusted-host pypi.python.org \
       --trusted-host files.pythonhosted.org \
       --trusted-host pypi.tuna.tsinghua.edu.cn \
-      pyserial-asyncio fastapi uvicorn PyYAML || true
+      pyserial-asyncio fastapi uvicorn PyYAML bcrypt websockets || true
 
 # 确保启动脚本有执行权限
 RUN chmod +x /app/start.sh 2>/dev/null || true
@@ -177,7 +177,7 @@ echo '[smartfan-init] 3/5 确保 pip 可用 + 补装依赖(首次启动较慢, �
   --trusted-host pypi.org --trusted-host pypi.python.org \
   --trusted-host files.pythonhosted.org \
   --trusted-host pypi.tuna.tsinghua.edu.cn \
-  -r /app/requirements.txt PyYAML pyserial pyserial-asyncio fastapi uvicorn schedule \
+  -r /app/requirements.txt PyYAML pyserial pyserial-asyncio fastapi uvicorn schedule bcrypt websockets \
   >/tmp/pip.log 2>&1 && echo '[smartfan-init] OK: 依赖检查完成' \
   || { echo '[smartfan-init] WARN: 依赖安装失败, 打印 pip.log 末尾 20 行:'; tail -20 /tmp/pip.log; }; \
 echo '[smartfan-init] 4/5 启动前检查 main.py 和 Python 环境'; \
