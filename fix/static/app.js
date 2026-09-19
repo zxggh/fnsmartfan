@@ -148,6 +148,8 @@ function closePwdModal() {
 //  应用初始化
 // ============================================================
 function initApp() {
+  // 初始化页面显示状态 (移动端默认只显示监控页)
+  switchPage("monitor");
   initChart();
   connectWebSocket();
   loadConfig();
