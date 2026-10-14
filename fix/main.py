@@ -237,7 +237,7 @@ async def lifespan(app: FastAPI):
             try:
                 if controller and ws_manager:
                     for entry in controller.drain_logs():
-                        await ws_manager.push_log(entry["dir"], entry["data"])
+                        await ws_manager.push_log(entry["dir"].lower(), entry["data"])
             except Exception as e:
                 logger.error(f"log_drain_loop 异常: {e}")
             await asyncio.sleep(1)

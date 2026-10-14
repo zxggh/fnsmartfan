@@ -16,6 +16,8 @@ let token = null;
 let ws = null;
 let chart = null;
 let sliderDebounceTimer = null;
+let currentPage = "monitor";
+let resizeTimer = null;
 
 // ============================================================
 //  认证相关
@@ -307,7 +309,10 @@ async function loadHistory(range) {
       { name: "环境", data: data.points.map(p => p.ntc), color: "#a8e6cf" },
     ].filter(s => s.data.some(v => v != null));
     chart.setOption({
-      tooltip: { trigger: "axis" },
+      tooltip: {
+        trigger: "axis",
+        valueFormatter: v => (v != null ? v.toFixed(1) : "--")
+      },
       legend: {
         data: series.map(s => s.name), top: 0,
         textStyle: { color: "#fff" },
@@ -417,6 +422,9 @@ async function loadDisconnectLog() {
     const data = await r.json();
     if (!data.ok) return;
     const list = document.getElementById("disc-list");
+    // 用户不在底部时: 不更新DOM, 保留查看位置
+    const wasAtBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 5;
+    if (!wasAtBottom) return;
     if (!data.entries || !data.entries.length) {
       list.innerHTML = "暂无断连记录";
       return;
@@ -426,6 +434,7 @@ async function loadDisconnectLog() {
       const dur = e.duration_s != null ? ` (${e.duration_s}s)` : "";
       return `<div class="disc-item">${status} ${e.start} → ${e.end || "..." + dur}</div>`;
     }).join("");
+    list.scrollTop = list.scrollHeight;
   } catch (e) {
     console.error("加载断连记录失败", e);
   }
@@ -457,16 +466,21 @@ async function sendRaw() {
 const MAX_LOG_LINES = 100;
 function appendLog(direction, content, timestamp) {
   const logBox = document.getElementById("comm-log");
+  // 记录追加前是否在底部
+  const wasAtBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 5;
   const ts = new Date(timestamp).toLocaleTimeString();
-  const prefix = direction === "tx" ? "→ TX" : "← RX";
+  const prefix = direction === "tx" ? "→ TX" : direction === "rx" ? "← RX" : "⚙ SYS";
   const line = `[${ts}] ${prefix}: ${content}\n`;
   logBox.textContent += line;
-  // 限制行数
-  const lines = logBox.textContent.split("\n");
-  if (lines.length > MAX_LOG_LINES) {
-    logBox.textContent = lines.slice(-MAX_LOG_LINES).join("\n");
+  if (wasAtBottom) {
+    // 用户在底部: 裁剪 + 滚动到底
+    const lines = logBox.textContent.split("\n");
+    if (lines.length > MAX_LOG_LINES) {
+      logBox.textContent = lines.slice(-MAX_LOG_LINES).join("\n");
+    }
+    logBox.scrollTop = logBox.scrollHeight;
   }
-  logBox.scrollTop = logBox.scrollHeight;
+  // 用户不在底部: 仅追加(textContent += 不影响滚动位置), 不裁剪不滚动
 }
 
 // ============================================================
@@ -480,25 +494,35 @@ function toggleCard(id) {
 }
 
 function switchPage(page) {
-  // 移动端: 切换显示区域
+  currentPage = page;
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.page === page));
   const monitor = document.getElementById("page-monitor");
   const right = document.querySelector(".col-right");
-  // 配置/日志分组卡片
   const configCards = document.querySelectorAll('.col-right [data-group="config"]');
   const logCards = document.querySelectorAll('.col-right [data-group="log"]');
 
+  // PC端 (>=768px): 双栏始终可见, 不切换页面
+  if (window.innerWidth >= 768) {
+    monitor.classList.remove("hidden");
+    right.classList.remove("hidden");
+    configCards.forEach(c => c.classList.remove("hidden"));
+    logCards.forEach(c => c.classList.remove("hidden"));
+    if (typeof chart !== "undefined" && chart) {
+      setTimeout(() => chart.resize(), 50);
+    }
+    return;
+  }
+
+  // 移动端 (<768px): 切换显示区域
   if (page === "monitor") {
     monitor.classList.remove("hidden");
     right.classList.add("hidden");
-    // 切回监控页时让 ECharts 重新计算尺寸 (移动端切页后容器尺寸变化)
     if (typeof chart !== "undefined" && chart) {
       setTimeout(() => chart.resize(), 50);
     }
   } else {
     monitor.classList.add("hidden");
     right.classList.remove("hidden");
-    // 配置页只显示配置组, 日志页只显示日志组
     configCards.forEach(c => c.classList.toggle("hidden", page !== "config"));
     logCards.forEach(c => c.classList.toggle("hidden", page !== "log"));
   }
@@ -509,4 +533,10 @@ function switchPage(page) {
 // ============================================================
 document.addEventListener("DOMContentLoaded", () => {
   checkAuth();
+});
+
+// 窗口尺寸变化时重新应用布局 (PC/移动端切换)
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => switchPage(currentPage), 200);
 });

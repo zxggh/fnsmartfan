@@ -1,12 +1,12 @@
 """
 STC 风扇控制器串口通信 — v5(诊断增强版)
 
-允许命令: F1CPD?, F1CPD=XX, GETNTC?, LED=ON, LED=OFF
+允许命令: F1_CUR_DUTY=XX (设置风扇占空比), AMB_TMP? (获取环境温度)
 
 v5 在 v4 基础上加诊断日志 + 修复 NTC 解析:
 
 [原 v4 修复]
-  - ping() 同时解析 NTC 响应并更新 ntc_cache, 删除心跳里的二次 GETNTC? 调用
+  - ping() 同时解析环境温度响应并更新 ntc_cache
     -> 心跳节奏从 5.1s 降到 3.5s, 远离 STC 5s 复位窗口
   - ping() 单次失败不再立即置 _connected=False, 连续 2 次失败才判定断开
   - ensure_connected() 永不放弃: 前 60 秒高频(2s/次), 之后低频(30s/次)
@@ -47,16 +47,14 @@ NTC_RE = re.compile(r"(?:NTC(?!\d)|AMB_TEMP)\s*[:：]?\s*([+-]?\d+\.?\d*)")
 #   这就是进度条更新迟滞的又一层隐藏原因.
 #   这里用正则 + 命令类型判断: 只要内容已包含"典型结束标记", 就立刻返回.
 # 典型确认回复:
-#   F1CPD=30  → 回复: F1_CPD=30%
-#   PING     → 回复: OK  或  PONG  或  NTC:26.5°C
-#   GETNTC?  → 回复: NTC: 26.5°C   或  NOCONNECT
-#   F1CPD?   → 回复: 当前转速 : 30%  或  F1_CPD=30%
+#   F1_CUR_DUTY=30 → 回复: F1_CPD=30% (固件回旧格式)
+#   AMB_TMP? → 回复: AMB_TMP: 26.5°C   或  NOCONNECT
 _RESP_END_OK_FAIL = re.compile(r"(^|\r?\n|\s)(OK|FAIL|NOCONNECT|PONG)(\r?\n|$)", re.I)
-_RESP_FAN_CONFIRM = re.compile(r"F\d(?:_CPD|_CUR_DUTY)\s*=\s*\d+%?|当前转速\s*[:：]\s*\d+%", re.I)
-_RESP_NTC = re.compile(r"(?:NTC(?!\d)|AMB_TEMP)\s*[:：]?\s*[+-]?\d+\.?\d*|NOCONNECT", re.I)
+_RESP_FAN_CONFIRM = re.compile(r"F\d(?:_CUR_DUTY|_CPD)\s*=\s*\d+%?", re.I)
+_RESP_NTC = re.compile(r"AMB_TMP\s*[:：]?\s*[+-]?\d+\.?\d*|NOCONNECT", re.I)
 # 哪些命令支持 "提前返回" (ping / set / query 这种 "一问一答短响应" 的)
 _EARLY_CMD_RE = re.compile(
-    r"^(PING|F\d(?:CPD|_CUR_DUTY)[=?]|LED|GETNTC\?|AMB_TMP\?|VERSION\?|REBOOT)", re.I
+    r"^(PING|F\d_CUR_DUTY[=?]|AMB_TMP\?|VERSION\?|REBOOT)", re.I
 )
 
 
@@ -72,8 +70,8 @@ def _resp_text_is_complete(raw_bytes: bytes, cmd: str) -> bool:
 
     判断规则:
       1. 结尾包含 \r\n (控制器完整行结尾)
-         且内容匹配 OK/FAIL/NOCONNECT/PONG / F*_CPD=xx% / 当前转速 / NTC:xx° 任一种;
-      2. 或者 字节长度 > 8 且包含 % 和 \n (F*CPD=xx% 确认最常见的情况)
+         且内容匹配 OK/FAIL/NOCONNECT/PONG / F*_CUR_DUTY=xx% / AMB_TMP:xx° 任一种;
+      2. 或者 字节长度 > 8 且包含 % 和 \n (F*_CUR_DUTY=xx% 确认最常见的情况)
     """
     if not raw_bytes:
         return False
@@ -91,7 +89,7 @@ def _resp_text_is_complete(raw_bytes: bytes, cmd: str) -> bool:
                         or _RESP_NTC.search(text))
     if ends_with_crlf and has_terminal:
         return True
-    # 兜底: 典型的 set_fan_speed 确认格式 (F1_CPD=30%)
+    # 兜底: 典型的 set_fan_speed 确认格式 (F1_CUR_DUTY=30%)
     if _RESP_FAN_CONFIRM.search(text):
         return True
     return False
@@ -400,28 +398,10 @@ class STCController:
         self._ping_fail_streak = 0
         # v8: 连接建立时重置失败计数 (但不重置 _reboot_issued_count 累计诊断数)
         self._consecutive_ping_fails_since_ok = 0
-        # v9: 连接后发 LED=ON (给固件一个"主机已连接"视觉信号)
-        #   即使 USB 刚连上可能还没完全就绪, 发了不坏事; 固件收不到就靠自己的超时逻辑
-        if self._writer:
-            try:
-                self._writer.write(b"LED=ON\r\n")
-                await asyncio.wait_for(self._writer.drain(), timeout=0.3)
-                self._log("TX", "LED=ON(连接指示)")
-            except Exception:
-                pass
 
     async def disconnect(self):
         self._connected = False
         r, w = self._reader, self._writer
-        # v9: 断开前尝试发 LED=OFF (给固件一个"主机侧断开"信号)
-        #   如果 USB 已死锁这步会失败, 但固件自己的命令超时会处理
-        if w:
-            try:
-                w.write(b"LED=OFF\r\n")
-                await asyncio.wait_for(w.drain(), timeout=0.3)
-                self._log("TX", "LED=OFF(断开指示)")
-            except Exception:
-                pass
         self._reader = None
         self._writer = None
         if w:
@@ -566,11 +546,11 @@ class STCController:
                     logger.info(f"重连持续中: 尝试{attempt}次 耗时{elapsed:.0f}s")
                 await asyncio.sleep(30)
 
-    # ── 心跳(ping + 顺带取 NTC, 不再二次发 GETNTC?) ──
+    # ── 心跳(ping + 顺带取环境温度) ──
     async def ping(self):
-        """心跳: 发 GETNTC? 一次, 既验证连接又顺带更新 NTC 缓存.
+        """心跳: 发 AMB_TMP? 一次, 既验证连接又顺带更新环境温度缓存.
 
-        - 成功(收到响应且能解析出 NTC 或响应长度合理): _ping_fail_streak=0, _connected=True
+        - 成功(收到响应且能解析出温度或响应长度合理): _ping_fail_streak=0, _connected=True
         - 失败(无响应/异常): _ping_fail_streak+=1, 连续 2 次才置 _connected=False
         - v8 新增: 连续失败累计 + 阈值触发 REBOOT (防 bUsbInBusy=1 死锁)
         - v9 新增: _reboot_in_progress 时直接返回 False (不空转, 不累计计数)
@@ -586,7 +566,7 @@ class STCController:
             return False
         try:
             # wait=2.0 适度, retries=0(心跳本身不重发, 避免拖慢节奏)
-            resp = await self._send_raw("GETNTC?", wait=2.0, retries=0)
+            resp = await self._send_raw("AMB_TMP?", wait=2.0, retries=0)
             if resp and len(resp) > 3:
                 # 顺带解析 NTC(失败也不影响 ping 成功判定)
                 self._parse_ntc_from_resp(resp)
@@ -625,7 +605,7 @@ class STCController:
             return False
 
     def _parse_ntc_from_resp(self, resp):
-        """从 GETNTC? 响应解析 NTC 温度并更新缓存.
+        """从 AMB_TMP? 响应解析环境温度并更新缓存.
 
         v5 改进:
         - 用 NTC_RE(已带 (?!\d) 负向断言), 排除 NTC1/NTC2 字段
@@ -656,10 +636,10 @@ class STCController:
 
         注意: 不在这里触发长重连(避免阻塞/死锁), 重连由 heartbeat 负责.
 
-        v7 优化: 识别 set_fan_speed 类命令 (F<N>CPD=<value>), 控制器通常 100ms 内就回确认,
+        v7 优化: 识别 set_fan_speed 类命令 (F<N>_CUR_DUTY=<value>), 控制器通常 100ms 内就回确认,
                 此时 wait 会设 1.0s, 但实际上死等 full wait 秒才解包返回 → 白白浪费 0.9s.
                 改为: 读到以 \r\n 结尾的单行"完整确认响应"就提前返回, 不再死等 wait 秒.
-                (判断完整: 含 F*_CPD=xx% 或 OK 或 FAIL 或 NOCONNECT 或 NTC: xx° 这些典型结束标记)
+                (判断完整: 含 F*_CUR_DUTY=xx% 或 OK 或 FAIL 或 NOCONNECT 或 AMB_TMP: xx° 这些典型结束标记)
         """
         if not self._connected:
             return ""
@@ -750,11 +730,11 @@ class STCController:
     # ── 业务API ──
 
     async def get_ntc_temp(self):
-        """环境温度(GETNTC?). 校验合理范围. 成功后更新缓存.
+        """环境温度(AMB_TMP?). 校验合理范围. 成功后更新缓存.
 
         注意: 心跳已通过 ping 顺带更新 ntc_cache, 这个方法主要给 API 直接调用.
         """
-        resp = await self.send("GETNTC?", wait=2.0)
+        resp = await self.send("AMB_TMP?", wait=2.0)
         m = NTC_RE.search(resp)
         if m:
             try:
@@ -782,41 +762,29 @@ class STCController:
 
     async def get_fan_speed(self, fan=1):
         """查询实际转速(更新缓存)."""
-        resp = await self.send(f"F{fan}CPD?", wait=2.0)
+        resp = await self.send(f"F{fan}_CUR_DUTY?", wait=2.0)
         val = None
-        m = re.search(rf"F{fan}_CPD=(\d+)%?", resp)
+        m = re.search(rf"F{fan}(?:_CUR_DUTY|_CPD)=(\d+)%?", resp)
         if m:
             val = int(m.group(1))
-        else:
-            m2 = re.search(r"当前转速\s*:\s*(\d+)%", resp)
-            if m2:
-                val = int(m2.group(1))
         if val is not None:
             self.speed_cache[fan] = val
             return {"ok": True, "value": val}
         return {"ok": False, "error": (resp or "无响应")[:60]}
 
     async def set_fan_speed(self, fan=1, speed=50):
-        """设置转速 — 等控制器回复确认后才更新缓存.
+        """设置风扇占空比 (F1_CUR_DUTY=XX). 等控制器回复确认后才更新缓存.
 
-        v7优化: 1秒无回复重发, 最多2次, 全部无反应则返回失败(不更新缓存).
-        原参数(2秒/3次)累计耗时过长, 温控响应慢.
-        v3.0: 改用新命令名 F1_CUR_DUTY=XX, 兼容旧名 F1CPD=XX.
-              响应格式: F1_CUR_DUTY=30% (旧固件回 F1_CPD=30%, 正则都兼容).
+        1秒无回复重发, 最多2次, 全部无反应则返回失败(不更新缓存).
+        响应格式: F1_CPD=30% (固件回旧格式)
         """
         speed = max(0, min(100, speed))
         for attempt in range(2):
-            # 发送新命令名 F1_CUR_DUTY=XX (旧固件兼容 F1CPD=XX)
             resp = await self.send(f"F{fan}_CUR_DUTY={speed}", wait=1.0)
             val = None
-            # 兼容新旧响应格式: F1_CUR_DUTY=30% 或 F1_CPD=30% 或 当前转速:30%
-            m = re.search(rf"F{fan}(?:_CPD|_CUR_DUTY)=(\d+)%?", resp)
+            m = re.search(rf"F{fan}(?:_CUR_DUTY|_CPD)=(\d+)%?", resp)
             if m:
                 val = int(m.group(1))
-            else:
-                m2 = re.search(r"当前转速\s*[:：]\s*(\d+)%", resp)
-                if m2:
-                    val = int(m2.group(1))
             if val is not None:
                 self.speed_cache[fan] = val
                 self._log("SYS", f"F{fan}确认 {val}%")
@@ -826,13 +794,6 @@ class STCController:
                 await asyncio.sleep(0.3)
         self._log("SYS", f"F{fan}设置2次无响应, 忽略")
         return {"ok": False, "error": "2次无响应"}
-
-    async def set_led(self, state: bool):
-        val = "ON" if state else "OFF"
-        resp = await self.send(f"LED={val}", wait=2.0)
-        if "OK" in resp:
-            return {"ok": True, "state": val}
-        return {"ok": False, "error": (resp or "无响应")[:60]}
 
     async def send_raw(self, cmd):
         return await self.send(cmd, wait=2.0)
