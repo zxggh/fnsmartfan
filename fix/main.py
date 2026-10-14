@@ -88,8 +88,13 @@ async def collect_temps_cached(max_age_s: float = _TEMPS_CACHE_MAX_AGE) -> dict:
 # ── 通信日志 (每天一个文件, 7 天滚动) ──
 COMM_LOG_DIR = Path("/data/comm_logs")
 
-def log_comm(direction: str, content: str):
-    """记录通信日志到文件 + 推送给 WebSocket 客户端."""
+def write_comm_log(direction: str, content: str):
+    """把一条通信日志写入当天日志文件 (7 天滚动清理).
+
+    说明: 通信日志的唯一来源是串口层的真实收发记录 (serial_ctrl._log),
+    由 log_drain_loop 统一「落盘 + 推送」, 保证一条收发只产生一条日志,
+    避免同一条命令被记录两次导致前端重复显示.
+    """
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         log_file = COMM_LOG_DIR / f"{today}.log"
@@ -108,9 +113,6 @@ def log_comm(direction: str, content: str):
                 pass
     except Exception as e:
         logger.debug(f"通信日志写入失败: {e}")
-    # 推送给 WebSocket 客户端
-    if ws_manager:
-        asyncio.create_task(ws_manager.push_log(direction, content))
 
 
 # ── Pydantic 模型 ──
@@ -231,13 +233,18 @@ async def lifespan(app: FastAPI):
 
     task_tc = asyncio.create_task(temp_collector_loop())
 
-    # 后台任务: 串口日志推送 (每 1 秒, 把 NTC 轮询等日志推到前端)
+    # 后台任务: 串口通信日志统一处理 (每 1 秒)
+    #   serial_ctrl._log 记录的是真实收发明细(TX/RX/SYS), 这里统一「落盘 + 推送」,
+    #   保证一条收发只产生一条日志 (不再由业务层重复记录)
     async def log_drain_loop():
         while True:
             try:
-                if controller and ws_manager:
+                if controller:
                     for entry in controller.drain_logs():
-                        await ws_manager.push_log(entry["dir"].lower(), entry["data"])
+                        d = entry["dir"].lower()
+                        write_comm_log(d, entry["data"])
+                        if ws_manager:
+                            await ws_manager.push_log(d, entry["data"])
             except Exception as e:
                 logger.error(f"log_drain_loop 异常: {e}")
             await asyncio.sleep(1)
@@ -268,8 +275,6 @@ async def lifespan(app: FastAPI):
                     r = await controller.set_fan_speed(1, target)
                     if r.get("ok"):
                         last_target = target
-                        log_comm("tx", f"F1_CUR_DUTY={target}")
-                        log_comm("rx", f"F1_CUR_DUTY={r.get('value')}%")
             except Exception as e:
                 logger.error(f"auto_control 异常: {e}")
                 await asyncio.sleep(3)
@@ -312,7 +317,7 @@ async def lifespan(app: FastAPI):
         await controller.disconnect()
 
 
-app = FastAPI(title="SmartFan Nexus", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="SmartFan Nexus", version="3.2.0", lifespan=lifespan)
 
 # ── 静态文件 ──
 STATIC_DIR = Path(__file__).parent / "static"
@@ -340,7 +345,7 @@ async def root():
     if idx.exists():
         html = idx.read_text(encoding="utf-8")
         return HTMLResponse(content=html, headers={"Cache-Control": "no-cache"})
-    return {"service": "SmartFan Nexus", "version": "3.1.0"}
+    return {"service": "SmartFan Nexus", "version": "3.2.0"}
 
 
 # ============================================================
@@ -420,10 +425,8 @@ async def update_temp_config(req: TempConfigRequest, request: Request):
     if current_mode == "manual" and controller and controller.connected:
         duty = new_config.get("manual_duty", 50)
         r = await controller.set_fan_speed(1, duty)
-        log_comm("tx", f"F1_CUR_DUTY={duty}")
         if r.get("ok"):
             confirmed_speed = r.get("value")
-            log_comm("rx", f"F1_CUR_DUTY={confirmed_speed}%")
 
     # 情况3: 切到自动模式 → 立即根据当前温度计算并下发 (不用等3秒轮询)
     elif kwargs.get("fan_mode") == "auto" and controller and controller.connected:
@@ -434,8 +437,6 @@ async def update_temp_config(req: TempConfigRequest, request: Request):
             r = await controller.set_fan_speed(1, target)
             if r.get("ok"):
                 confirmed_speed = r.get("value")
-                log_comm("tx", f"F1_CUR_DUTY={target}")
-                log_comm("rx", f"F1_CUR_DUTY={confirmed_speed}%")
 
     result = {"ok": True, "config": new_config}
     if confirmed_speed is not None:
@@ -462,9 +463,6 @@ async def send_command(req: CommandRequest, request: Request):
     if not controller or not controller.connected:
         raise HTTPException(503, "控制器未连接")
     resp = await controller.send_raw(req.content)
-    log_comm("tx", req.content)
-    if resp:
-        log_comm("rx", resp)
     return {"ok": True, "command": req.content, "response": resp}
 
 
@@ -495,7 +493,7 @@ async def get_info():
         "ok": True,
         "data": {
             "service": "SmartFan Nexus",
-            "version": "3.1.0",
+            "version": "3.2.0",
             "uptime": round(time.time() - start_time, 1),
             "controller_connected": controller.connected if controller else False,
         }
@@ -572,7 +570,7 @@ def handle_command_sync(content: str) -> str:
 
 # ── 入口 ──
 def main():
-    logger.info("启动 SmartFan Nexus v3.0.0")
+    logger.info("启动 SmartFan Nexus v3.2.0")
     uvicorn.run("main:app", host="0.0.0.0", port=8780, reload=False, log_level="info")
 
 

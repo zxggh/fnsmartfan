@@ -18,6 +18,8 @@ let chart = null;
 let sliderDebounceTimer = null;
 let currentPage = "monitor";
 let resizeTimer = null;
+let chartInited = false;   // 图表是否已初始化 (防止重复 init 产生多个 ECharts 实例)
+let discTimer = null;      // 断连记录轮询定时器 (防止重复注册)
 
 // ============================================================
 //  认证相关
@@ -152,34 +154,55 @@ function closePwdModal() {
 function initApp() {
   // 初始化页面显示状态 (移动端默认只显示监控页)
   switchPage("monitor");
-  initChart();
+  // 图表只初始化一次 (重复 init 会产生多个 ECharts 实例)
+  if (!chartInited) {
+    initChart();
+    chartInited = true;
+  }
+  // connectWebSocket 内部已做防重 (会先关闭旧连接), 可安全重复调用
   connectWebSocket();
   loadConfig();
   loadHistory("24h");
   loadDisconnectLog();
-  setInterval(loadDisconnectLog, 30000);
-  // 绑定事件
-  document.getElementById("range-select").addEventListener("change", e => loadHistory(e.target.value));
+  // 轮询定时器只注册一次
+  if (!discTimer) {
+    discTimer = setInterval(loadDisconnectLog, 30000);
+  }
+  // 绑定事件 (用 onXXX 赋值而非 addEventListener, 重复调用不会累积监听器)
+  document.getElementById("range-select").onchange = e => loadHistory(e.target.value);
   document.getElementById("btn-change-pwd").onclick = openPwdModal;
   document.getElementById("btn-logout").onclick = doLogout;
   document.getElementById("login-btn").onclick = doLogin;
-  document.getElementById("login-password").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+  document.getElementById("login-password").onkeydown = e => { if (e.key === "Enter") doLogin(); };
 }
 
 // ============================================================
 //  WebSocket
 // ============================================================
 function connectWebSocket() {
+  // 防重复: 若已有连接, 先彻底关闭并解绑回调, 避免多个 WS 同时接收导致日志重复显示
+  if (ws) {
+    try {
+      ws.onclose = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.close();
+    } catch (e) { /* ignore */ }
+    ws = null;
+  }
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = `${proto}//${location.host}/ws?token=${encodeURIComponent(token || "")}`;
-  ws = new WebSocket(wsUrl);
-  ws.onopen = () => console.log("WebSocket 已连接");
-  ws.onmessage = onWsMessage;
-  ws.onclose = () => {
+  const sock = new WebSocket(wsUrl);
+  ws = sock;
+  sock.onopen = () => console.log("WebSocket 已连接");
+  sock.onmessage = onWsMessage;
+  sock.onclose = () => {
+    // 仅当仍是当前连接时才重连 (旧连接被替换后不再重连)
+    if (ws !== sock) return;
     console.log("WebSocket 断开, 3秒后重连...");
-    setTimeout(connectWebSocket, 3000);
+    setTimeout(() => { if (ws === sock) connectWebSocket(); }, 3000);
   };
-  ws.onerror = e => console.error("WebSocket 错误", e);
+  sock.onerror = e => console.error("WebSocket 错误", e);
 }
 
 function onWsMessage(event) {
