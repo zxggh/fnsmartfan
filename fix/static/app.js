@@ -17,7 +17,6 @@ let ws = null;
 let chart = null;
 let sliderDebounceTimer = null;
 let currentPage = "monitor";
-let resizeTimer = null;
 let chartInited = false;   // 图表是否已初始化 (防止重复 init 产生多个 ECharts 实例)
 let discTimer = null;      // 断连记录轮询定时器 (防止重复注册)
 
@@ -516,38 +515,21 @@ function toggleCard(id) {
   if (btn) btn.textContent = body.classList.contains("collapsed") ? "展开" : "收起";
 }
 
+// 页面切换
+// 说明: JS 只负责记录当前页 (body[data-page]) 和导航按钮高亮,
+// 各栏/各卡片的显示与隐藏完全交给 style.css 的媒体查询统一判定.
+// 这样 JS 与 CSS 只有一个判定源, 不会出现「CSS 已按移动端单列渲染,
+// JS 却按 PC 端处理」的错位 (外网经反向代理/远程访问/嵌入 iframe 访问时,
+// window.innerWidth 与 CSS 媒体查询的视口宽度可能不一致, 曾导致 <768px 无法切换).
 function switchPage(page) {
   currentPage = page;
+  document.body.dataset.page = page;
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.page === page));
-  const monitor = document.getElementById("page-monitor");
-  const right = document.querySelector(".col-right");
-  const configCards = document.querySelectorAll('.col-right [data-group="config"]');
-  const logCards = document.querySelectorAll('.col-right [data-group="log"]');
-
-  // PC端 (>=768px): 双栏始终可见, 不切换页面
-  if (window.innerWidth >= 768) {
-    monitor.classList.remove("hidden");
-    right.classList.remove("hidden");
-    configCards.forEach(c => c.classList.remove("hidden"));
-    logCards.forEach(c => c.classList.remove("hidden"));
-    if (typeof chart !== "undefined" && chart) {
-      setTimeout(() => chart.resize(), 50);
-    }
-    return;
-  }
-
-  // 移动端 (<768px): 切换显示区域
-  if (page === "monitor") {
-    monitor.classList.remove("hidden");
-    right.classList.add("hidden");
-    if (typeof chart !== "undefined" && chart) {
-      setTimeout(() => chart.resize(), 50);
-    }
-  } else {
-    monitor.classList.add("hidden");
-    right.classList.remove("hidden");
-    configCards.forEach(c => c.classList.toggle("hidden", page !== "config"));
-    logCards.forEach(c => c.classList.toggle("hidden", page !== "log"));
+  // 卡片显隐交给 CSS 后, 需清掉历史遗留的 hidden 类, 避免残留状态影响显示
+  document.querySelectorAll(".col-left, .col-right, .col-right .card").forEach(el => el.classList.remove("hidden"));
+  // 图表在容器由隐藏变为可见后需要重新计算尺寸
+  if (typeof chart !== "undefined" && chart) {
+    setTimeout(() => chart.resize(), 50);
   }
 }
 
@@ -556,10 +538,4 @@ function switchPage(page) {
 // ============================================================
 document.addEventListener("DOMContentLoaded", () => {
   checkAuth();
-});
-
-// 窗口尺寸变化时重新应用布局 (PC/移动端切换)
-window.addEventListener("resize", () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => switchPage(currentPage), 200);
 });

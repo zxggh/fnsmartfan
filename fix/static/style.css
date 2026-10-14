@@ -345,6 +345,15 @@ body {
   .chart-container { height: 220px; }
   .mobile-nav { display: flex; }
   .topbar h1 { font-size: 16px; }
+
+  /* 页面切换: 显隐完全由本媒体查询判定 (JS 只写 body[data-page])。
+     这样 JS 与 CSS 只用一个判定源, 不会因外网反代/嵌入访问导致
+     window.innerWidth 与媒体查询视口宽度不一致而切不动页面。 */
+  body[data-page="monitor"] .col-right { display: none; }
+  body[data-page="config"] .col-left { display: none; }
+  body[data-page="config"] .col-right [data-group="log"] { display: none; }
+  body[data-page="log"] .col-left { display: none; }
+  body[data-page="log"] .col-right [data-group="config"] { display: none; }
 }
 
 /* PC: 隐藏移动端导航 */
